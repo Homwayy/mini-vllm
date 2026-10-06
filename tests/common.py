@@ -1,11 +1,14 @@
 """Helpers shared by the correctness tests: a scattered block layout, packed prefill and batched greedy decode."""
 
+import argparse
 import random
 
 import numpy as np
 import torch
 
 from minivllm.attention import AttnMetadata
+from minivllm.attention.flex import FlexAttention
+from minivllm.attention.gather import GatherAttention
 
 VAL_BIN = r"A:\GitHub project\nanoGPT\data\fineweb_edu\val.bin"
 EOT = 50256  # GPT-2 <|endoftext|>, placed before every document in val.bin
@@ -17,6 +20,15 @@ def val_documents(n_tokens=2_000_000):
     bounds = np.flatnonzero(data == EOT)
     for a, b in zip(bounds[:-1], bounds[1:]):
         yield data[a + 1 : b].tolist()
+
+
+def attention_from_args(block_size, max_tokens, max_seqs, device):
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--attn", choices=["gather", "flex"], default="gather")
+    name = parser.parse_args().attn
+    if name == "gather":
+        return name, GatherAttention()
+    return name, FlexAttention(block_size, max_tokens, max_seqs, device)
 
 
 def logit_stats(x, ref):

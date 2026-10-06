@@ -15,6 +15,8 @@ class AttnMetadata:
     block_tables: torch.Tensor | None = None  # [B, max_blocks] int32
     context_lens: torch.Tensor | None = None  # [B] int32, cached tokens including this step's
     max_context_len: int = 0
+    # built by the attention backend on its first call in a step, then shared by all layers
+    backend_state: object = None
 
 
 def store_kv(k, v, k_cache, v_cache, slot_mapping):

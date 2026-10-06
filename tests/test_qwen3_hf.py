@@ -5,7 +5,7 @@
 2. Greedy decoding: our batched decode vs HF's bf16 decode, token by token.
 3. Teacher forcing: our per-step decode logits vs the fp32 reference on the same tokens.
 
-Run from the repo root: python -m tests.test_qwen3_hf
+Run from the repo root: python -m tests.test_qwen3_hf [--attn gather|flex]
 """
 
 import json
@@ -15,16 +15,14 @@ import tiktoken
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from minivllm.attention.gather import GatherAttention
 from minivllm.models.qwen3 import load_qwen3
 from minivllm.utils import cap_gpu_memory
-from tests.common import logit_stats, print_stats, run_ours, val_documents
+from tests.common import attention_from_args, logit_stats, print_stats, run_ours, val_documents
 
 CKPT = os.path.join("checkpoints", "Qwen3-0.6B")
 PROMPT_LENS = [17, 120, 517, 1000]
 NEW_TOKENS = 64
 BLOCK_SIZE = 16
-OUT = os.path.join("results", "e0_qwen3.json")
 
 
 def real_text_prompts(tok, lengths):
@@ -57,9 +55,10 @@ def main():
     device = "cuda"
     torch.cuda.init()
     cap_gpu_memory()
+    attn_name, attn = attention_from_args(BLOCK_SIZE, 4096, len(PROMPT_LENS), device)
     tok = AutoTokenizer.from_pretrained(CKPT)
     prompts = real_text_prompts(tok, PROMPT_LENS)
-    model = load_qwen3(CKPT, GatherAttention(), device)
+    model = load_qwen3(CKPT, attn, device)
     hf16 = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.bfloat16).to(device).eval()
     hf32 = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.float32).to(device).eval()
 
@@ -98,9 +97,10 @@ def main():
 
     print("sample:", repr(tok.decode(prompts[1][-20:] + our_tokens[1][:30])))
     os.makedirs("results", exist_ok=True)
-    with open(OUT, "w") as f:
-        json.dump({"model": "Qwen3-0.6B", "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
-    print("wrote", OUT)
+    out = os.path.join("results", f"e0_qwen3_{attn_name}.json")
+    with open(out, "w") as f:
+        json.dump({"model": "Qwen3-0.6B", "attention": attn_name, "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
+    print("wrote", out)
 
 
 if __name__ == "__main__":
