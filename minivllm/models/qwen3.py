@@ -119,6 +119,8 @@ class Qwen3ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(Qwen3DecoderLayer(cfg, attn_backend) for _ in range(cfg.num_hidden_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.cos = self.sin = None  # [max_positions, head_dim] fp32, built by init_rope()
+        self.num_kv_heads, self.head_dim = cfg.num_key_value_heads, cfg.head_dim
+        self.attn_layers = [layer.self_attn for layer in self.layers]
 
     def init_rope(self, device):
         self.cos, self.sin = rope_cache(self.cfg.head_dim, self.cfg.rope_theta, self.max_positions, device)
