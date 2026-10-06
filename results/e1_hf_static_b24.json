@@ -1,0 +1,35 @@
+{
+ "engine": "transformers generate, static batching",
+ "batch_size": 24,
+ "attn_implementation": "sdpa",
+ "workload": "W1",
+ "num_requests": 256,
+ "temperature": 0.6,
+ "warmup_s": 28.234434500001953,
+ "gpu": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+ "torch": "2.11.0+cu128",
+ "median_output_throughput": 159.58478140423347,
+ "runs": [
+  {
+   "elapsed_s": 914.9055361999999,
+   "output_tokens": 146005,
+   "generated_tokens": 250544,
+   "output_throughput": 159.58478140423347,
+   "total_throughput": 321.3348136694771,
+   "batch_s": [
+    91.72840590000123,
+    84.36604539999826,
+    77.33799539999745,
+    88.93855930000427,
+    88.45080920000328,
+    81.38504249999824,
+    87.59298459999991,
+    75.3940322999988,
+    88.15177140000014,
+    88.5252971000009,
+    63.033358699998644
+   ],
+   "peak_memory_gib": 6.769370079040527
+  }
+ ]
+}
