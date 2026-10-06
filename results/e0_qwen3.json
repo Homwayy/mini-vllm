@@ -1,0 +1,123 @@
+{
+  "model": "Qwen3-0.6B",
+  "block_size": 16,
+  "new_tokens": 64,
+  "prompts": [
+    {
+      "prompt_len": 17,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.5117664337158203,
+        "mean_abs_err": 0.04053116962313652,
+        "argmax_agree": 0.9411764740943909,
+        "max_fp32_regret": 0.04472160339355469
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.5117664337158203,
+        "mean_abs_err": 0.041755255311727524,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.31937599182128906,
+        "mean_abs_err": 0.03208767622709274,
+        "argmax_agree": 0.96875,
+        "max_fp32_regret": 0.04286384582519531
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.27733707427978516,
+        "mean_abs_err": 0.031647395342588425,
+        "argmax_agree": 0.96875,
+        "max_fp32_regret": 0.08468055725097656
+      },
+      "greedy_first_divergence": 11,
+      "hf_top2_margin_at_divergence": 0.125
+    },
+    {
+      "prompt_len": 120,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.6582505702972412,
+        "mean_abs_err": 0.048569854348897934,
+        "argmax_agree": 0.9666666984558105,
+        "max_fp32_regret": 0.09423351287841797
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.670861005783081,
+        "mean_abs_err": 0.0492246113717556,
+        "argmax_agree": 0.9666666984558105,
+        "max_fp32_regret": 0.11180877685546875
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.4436054229736328,
+        "mean_abs_err": 0.03879222273826599,
+        "argmax_agree": 0.953125,
+        "max_fp32_regret": 0.07686424255371094
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.42471933364868164,
+        "mean_abs_err": 0.0394955575466156,
+        "argmax_agree": 0.96875,
+        "max_fp32_regret": 0.10083580017089844
+      },
+      "greedy_first_divergence": 1,
+      "hf_top2_margin_at_divergence": 0.0
+    },
+    {
+      "prompt_len": 517,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 1.0800457000732422,
+        "mean_abs_err": 0.0391700342297554,
+        "argmax_agree": 0.980657696723938,
+        "max_fp32_regret": 0.1908426284790039
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.6019353866577148,
+        "mean_abs_err": 0.038780294358730316,
+        "argmax_agree": 0.9729207158088684,
+        "max_fp32_regret": 0.1908426284790039
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.40671586990356445,
+        "mean_abs_err": 0.036620233207941055,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.0095062255859375
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.4357602596282959,
+        "mean_abs_err": 0.034895844757556915,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.040813446044921875
+      },
+      "greedy_first_divergence": 33,
+      "hf_top2_margin_at_divergence": 0.0
+    },
+    {
+      "prompt_len": 1000,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.5939693450927734,
+        "mean_abs_err": 0.03659094125032425,
+        "argmax_agree": 0.9740000367164612,
+        "max_fp32_regret": 0.13346290588378906
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.6219949722290039,
+        "mean_abs_err": 0.0362514965236187,
+        "argmax_agree": 0.9790000319480896,
+        "max_fp32_regret": 0.11992263793945312
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.34772658348083496,
+        "mean_abs_err": 0.03583657741546631,
+        "argmax_agree": 0.96875,
+        "max_fp32_regret": 0.037006378173828125
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.4102287292480469,
+        "mean_abs_err": 0.03564359247684479,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.037006378173828125
+      },
+      "greedy_first_divergence": 7,
+      "hf_top2_margin_at_divergence": 0.125
+    }
+  ]
+}
