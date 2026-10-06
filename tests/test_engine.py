@@ -6,6 +6,9 @@ a reference forward (gather backend, one prefill of prompt + completion), and ea
 the reference argmax up to bf16 noise. A KV bookkeeping error (a wrong slot, block table, or recompute
 after preemption) produces tokens far from the argmax.
 
+Decode runs in CUDA graphs. Replaying a graph runs the same kernels on the same padded shapes as the eager
+path, so for each policy the eager engine must produce exactly the same tokens.
+
 Run from the repo root: python -m tests.test_engine
 """
 
@@ -64,6 +67,7 @@ def replay_regret(model, seqs):
 
 
 def run_case(engine, prompts, params, label):
+    engine.runner.use_cuda_graph = True
     seqs = engine.generate(prompts, params)
     regret, exact = replay_regret(engine.runner.model, seqs)
     lengths_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, params))
@@ -76,7 +80,13 @@ def run_case(engine, prompts, params, label):
         f"prefill steps {prefills:3d}, max decode batch {max_batch:2d}, lengths {'ok' if lengths_ok else 'WRONG'}, "
         f"KV {'released' if released else 'LEAKED'}"
     )
-    return ok
+    graph_tokens = [s.token_ids for s in seqs]
+    engine.reset()
+    engine.runner.use_cuda_graph = False
+    same = [s.token_ids for s in engine.generate(prompts, params)] == graph_tokens
+    engine.runner.use_cuda_graph = True
+    print(f"{'':58s} eager decode gives {'identical' if same else 'DIFFERENT'} tokens")
+    return ok and same
 
 
 def main():
@@ -89,23 +99,20 @@ def main():
         engine.cfg = EngineConfig(**{**cfg.__dict__, **case})
         engine.reset()
         ok &= run_case(engine, prompts, params, f"qwen3 flex {case}")
+    # sampling path: lengths only
     engine.cfg = cfg
-    engine.reset()
-    flex = engine.runner.model.attn_layers[0].attn
-    for a in engine.runner.model.attn_layers:
-        a.attn = GatherAttention()
-    ok &= run_case(engine, prompts, params, "qwen3 gather {'kv': 'paged', 'batching': 'continuous'}")
-    for a in engine.runner.model.attn_layers:
-        a.attn = flex
-
-    # sampling path: lengths and token range only
     engine.reset()
     sampled = [SamplingParams(temperature=0.6, top_p=0.9, max_tokens=p.max_tokens, ignore_eos=True) for p in params]
     seqs = engine.generate(prompts, sampled)
     sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
     print(f"qwen3 flex sampling (temperature 0.6, top_p 0.9): lengths {'ok' if sample_ok else 'WRONG'}")
     ok &= sample_ok
-    del engine, flex
+    del engine
+    torch.cuda.empty_cache()
+
+    engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "attention": "gather"}))
+    ok &= run_case(engine, prompts, params, "qwen3 gather {'kv': 'paged', 'batching': 'continuous'}")
+    del engine
     torch.cuda.empty_cache()
 
     gcfg = EngineConfig(model="gpt2", num_kv_blocks=1024, max_num_seqs=16, max_num_batched_tokens=4096, max_model_len=512)

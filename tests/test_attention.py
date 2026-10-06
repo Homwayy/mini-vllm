@@ -16,6 +16,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
+from minivllm.model_runner import decode_buckets
 
 BLOCK_SIZE = 16
 NUM_BLOCKS = 8192
@@ -68,21 +69,26 @@ def check_prefill(backends, Hq, Hkv, D, rng, rounds, device):
 
 
 def check_decode(backends, Hq, Hkv, D, rng, rounds, device):
-    k_cache = torch.randn(NUM_BLOCKS, BLOCK_SIZE, Hkv, D, device=device, dtype=torch.bfloat16)
+    # the last block is the scratch block that padding rows use, as in the model runner
+    k_cache = torch.randn(NUM_BLOCKS + 1, BLOCK_SIZE, Hkv, D, device=device, dtype=torch.bfloat16)
     v_cache = torch.randn_like(k_cache)
     max_blocks = MAX_CTX // BLOCK_SIZE
+    buckets = decode_buckets(MAX_SEQS)
     worst = {name: 0.0 for name in backends}
     for r in range(rounds):
         B = [1, 2, 3, 64][r] if r < 4 else rng.randint(1, MAX_SEQS)
         ctx = [rng.choice([1, 16, 17, MAX_CTX]) if rng.random() < 0.2 else rng.randint(1, MAX_CTX) for _ in range(B)]
         npages = [(n + BLOCK_SIZE - 1) // BLOCK_SIZE for n in ctx]
         pages = rng.sample(range(NUM_BLOCKS), sum(npages))
-        table = [[0] * max_blocks for _ in range(B)]
+        padded = next(b for b in buckets if b >= B)
+        table = [[0] * max_blocks for _ in range(padded)]
         for b, n in enumerate(npages):
             table[b][:n], pages = pages[:n], pages[n:]
+        for b in range(B, padded):
+            table[b][0] = NUM_BLOCKS
         block_tables = torch.tensor(table, dtype=torch.int32, device=device)
-        context_lens = torch.tensor(ctx, dtype=torch.int32, device=device)
-        q = torch.randn(B, Hq, D, device=device, dtype=torch.bfloat16)
+        context_lens = torch.tensor(ctx + [1] * (padded - B), dtype=torch.int32, device=device)
+        q = torch.randn(padded, Hq, D, device=device, dtype=torch.bfloat16)
         ref = []
         for b in range(B):
             pos = torch.arange(ctx[b], device=device)
@@ -96,7 +102,7 @@ def check_decode(backends, Hq, Hkv, D, rng, rounds, device):
                 is_prefill=False, slot_mapping=None, block_tables=block_tables, context_lens=context_lens,
                 max_context_len=max(ctx),
             )
-            out = attn(q, None, None, k_cache, v_cache, meta)
+            out = attn(q, None, None, k_cache, v_cache, meta)[:B]
             worst[name] = max(worst[name], (out.float() - ref).abs().max().item())
     return worst
 

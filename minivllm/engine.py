@@ -18,6 +18,7 @@ class EngineConfig:
     kv: str = "paged"  # "paged", or "contiguous": a fixed max_model_len region per sequence
     admission: str = "reserve"  # paged only: "reserve" blocks for prompt + max_tokens, or "optimistic"
     batching: str = "continuous"  # "continuous" or "static"
+    cuda_graph: bool = True  # capture the decode step per batch-size bucket
     block_size: int = 16
     num_kv_blocks: int = 4096
     max_num_seqs: int = 256

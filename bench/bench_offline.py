@@ -77,6 +77,7 @@ def main():
     ap.add_argument("--max-num-seqs", type=int, default=d.max_num_seqs)
     ap.add_argument("--max-num-batched-tokens", type=int, default=d.max_num_batched_tokens)
     ap.add_argument("--max-model-len", type=int, default=d.max_model_len)
+    ap.add_argument("--no-cuda-graph", action="store_true")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0, help="use only the first N requests (smoke tests)")
     ap.add_argument("--seed", type=int, default=0)
@@ -87,13 +88,17 @@ def main():
         model=args.model, attention=args.attention, kv=args.kv, admission=args.admission, batching=args.batching,
         num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens, max_model_len=args.max_model_len,
+        cuda_graph=not args.no_cuda_graph,
     )
     w = load_workload(args.workload)
     reqs = w["requests"][: args.limit or None]
     temperature = w["sampling"]["temperature"]
 
     engine = LLMEngine(cfg)
-    print(f"{cfg}\nKV pool {engine.runner.kv_bytes / 2**30:.2f} GiB, {cfg.num_kv_blocks * cfg.block_size} slots")
+    runner = engine.runner
+    print(f"{cfg}\nKV pool {runner.kv_bytes / 2**30:.2f} GiB, {cfg.num_kv_blocks * cfg.block_size} slots")
+    if cfg.cuda_graph:
+        print(f"captured {len(runner.graphs)} decode graphs in {runner.graph_capture_s:.1f} s, {runner.graph_memory_bytes / 2**20:.0f} MiB")
     t = time.perf_counter()
     engine.warmup(temperature)
     warmup_s = time.perf_counter() - t
@@ -132,7 +137,8 @@ def main():
     with open(args.out, "w") as f:
         json.dump({
             "config": cfg.__dict__, "workload": w["name"], "num_requests": len(reqs), "temperature": temperature,
-            "warmup_s": warmup_s, "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
+            "warmup_s": warmup_s, "graph_capture_s": runner.graph_capture_s, "graph_memory_mib": runner.graph_memory_bytes / 2**20,
+            "gpu": torch.cuda.get_device_name(), "torch": torch.__version__,
             "median_output_throughput": med, "runs": runs,
         }, f, indent=1)
     print("wrote", args.out)
