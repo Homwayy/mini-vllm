@@ -76,11 +76,12 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         t0 = time.perf_counter()
         generated, batch_s = 0, []
-        for b in batches:
+        for i, b in enumerate(batches):
             tb = time.perf_counter()
             generated += len(b) * run_batch(model, b, temperature)
             torch.cuda.synchronize()
             batch_s.append(time.perf_counter() - tb)
+            print(f"  run {r} batch {i + 1}/{len(batches)}: {batch_s[-1]:.1f} s", flush=True)
         elapsed = time.perf_counter() - t0
         s = {
             "elapsed_s": elapsed,
