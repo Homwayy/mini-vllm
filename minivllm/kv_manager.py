@@ -24,7 +24,7 @@ class ContiguousKV:
         self.num_regions = num_blocks // self.blocks_per_seq
         self.free_regions = deque(range(self.num_regions))
 
-    def can_admit(self, seq: Sequence):
+    def can_admit(self, seq: Sequence, num_running: int):
         return bool(self.free_regions)
 
     def admit(self, seq: Sequence):
@@ -48,25 +48,33 @@ class ContiguousKV:
 class PagedKV:
     """Blocks are handed out one at a time as sequences grow.
 
-    reserve_full_length: admit a sequence only if blocks for its prompt plus max_tokens are still
-    unreserved, so running sequences never run out of blocks. Otherwise a sequence is admitted as soon
-    as its prompt fits, and the scheduler preempts when the pool runs dry.
+    Admission policies:
+      reserve: admit a sequence only if blocks for its prompt plus max_tokens are still unreserved, so
+        running sequences never run out of blocks.
+      optimistic: admit a sequence as soon as its current tokens fit; the scheduler preempts when the pool
+        runs dry.
+      headroom: optimistic, but after admitting, one free block must remain for every running sequence,
+        so each can grow by a block before anything is preempted.
     """
 
-    def __init__(self, num_blocks, block_size, reserve_full_length):
+    def __init__(self, num_blocks, block_size, admission):
+        assert admission in ("reserve", "optimistic", "headroom")
         self.block_size = block_size
         self.num_blocks = num_blocks
-        self.reserve_full_length = reserve_full_length
+        self.admission = admission
         self.free_blocks = deque(range(num_blocks))
-        self.reserved = 0  # blocks promised to running sequences (reserve_full_length only)
+        self.reserved = 0  # blocks promised to running sequences (reserve only)
 
-    def can_admit(self, seq: Sequence):
-        if self.reserve_full_length:
+    def can_admit(self, seq: Sequence, num_running: int):
+        if self.admission == "reserve":
             return self.reserved + cdiv(seq.max_len, self.block_size) <= self.num_blocks
-        return cdiv(len(seq), self.block_size) <= len(self.free_blocks)
+        need = cdiv(len(seq), self.block_size)
+        if self.admission == "headroom":
+            need += num_running + 1
+        return need <= len(self.free_blocks)
 
     def admit(self, seq: Sequence):
-        if self.reserve_full_length:
+        if self.admission == "reserve":
             self.reserved += cdiv(seq.max_len, self.block_size)
         self.append(seq)
 
@@ -78,7 +86,7 @@ class PagedKV:
             seq.block_table.append(self.free_blocks.popleft())
 
     def release(self, seq: Sequence):
-        if self.reserve_full_length:
+        if self.admission == "reserve":
             self.reserved -= cdiv(seq.max_len, self.block_size)
         self.free_blocks.extend(seq.block_table)
         seq.block_table = []

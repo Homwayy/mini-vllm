@@ -16,7 +16,7 @@ class EngineConfig:
     model_path: str | None = None
     attention: str = "flex"  # "flex" or "gather"
     kv: str = "paged"  # "paged", or "contiguous": a fixed max_model_len region per sequence
-    admission: str = "reserve"  # paged only: "reserve" blocks for prompt + max_tokens, or "optimistic"
+    admission: str = "reserve"  # paged only: "reserve", "optimistic" or "headroom" (see PagedKV)
     batching: str = "continuous"  # "continuous" or "static"
     cuda_graph: bool = True  # capture the decode step per batch-size bucket
     block_size: int = 16
@@ -50,7 +50,7 @@ class LLMEngine:
         if cfg.kv == "contiguous":
             kv = ContiguousKV(cfg.num_kv_blocks, cfg.block_size, cfg.max_model_len)
         else:
-            kv = PagedKV(cfg.num_kv_blocks, cfg.block_size, reserve_full_length=cfg.admission == "reserve")
+            kv = PagedKV(cfg.num_kv_blocks, cfg.block_size, cfg.admission)
         self.kv = kv
         self.scheduler = Scheduler(kv, cfg.max_num_seqs, cfg.max_num_batched_tokens, cfg.batching == "continuous")
         self.steps: list[StepRecord] = []

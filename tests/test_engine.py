@@ -29,6 +29,7 @@ CASES = [
     dict(kv="paged", admission="reserve", batching="continuous"),
     dict(kv="paged", admission="optimistic", batching="static", num_kv_blocks=48),
     dict(kv="paged", admission="optimistic", batching="continuous", num_kv_blocks=48),
+    dict(kv="paged", admission="headroom", batching="continuous", num_kv_blocks=48),
 ]
 
 

@@ -40,7 +40,7 @@ class Scheduler:
         seqs, tokens = [], 0
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
-            if tokens + len(seq) > self.max_num_batched_tokens or not self.kv.can_admit(seq):
+            if tokens + len(seq) > self.max_num_batched_tokens or not self.kv.can_admit(seq, len(self.running)):
                 break
             self.waiting.popleft()
             self.kv.admit(seq)
