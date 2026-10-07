@@ -10,6 +10,9 @@ Besides throughput and latency, each level reports how drafting went over its de
     (sequence, step) pairs; without drafting it is 1;
   drafts per step: draft tokens checked per sequence and step;
   acceptance rate: accepted drafts / drafts checked.
+It also reports how repetitive the outputs are, which bounds what copying can achieve:
+  copyable share: output tokens equal to the token that followed the latest earlier occurrence of the
+    4 tokens before them (in prompt or output).
 
 Run from the repo root, e.g.:
     python -m bench.bench_spec --out results/e8a_off.json
@@ -28,6 +31,19 @@ from bench.bench_offline import summarize
 from bench.workloads import load_workload
 from minivllm.engine import EngineConfig, LLMEngine
 from minivllm.sequence import SamplingParams
+
+
+def copyable_share(seqs, n=4):
+    hits = total = 0
+    for s in seqs:
+        t, last = s.token_ids, {}
+        for i in range(n, len(t)):
+            key = tuple(t[i - n : i])
+            if i >= s.num_prompt_tokens:
+                total += 1
+                hits += key in last and t[last[key]] == t[i]
+            last[key] = i
+    return hits / total
 
 
 def run_once(engine, reqs, concurrency, temperature, seed):
@@ -52,6 +68,7 @@ def run_once(engine, reqs, concurrency, temperature, seed):
         "acceptance_rate": accepted / drafted if drafted else float("nan"),
         "drafted_tokens": drafted,
         "accepted_tokens": accepted,
+        "copyable_share": copyable_share(seqs),
     })
     return s
 
@@ -100,7 +117,7 @@ def main():
         print(f"concurrency {c:3d}: output {s['output_throughput']:7.0f} tok/s (runs {', '.join(f'{x:.0f}' for x in tput)}), "
               f"TPOT p50 {s['tpot_p50_ms']:.2f} ms, decode steps {s['decode_steps']}, step {s['decode_step_ms_mean']:.2f} ms, "
               f"tokens/step {s['tokens_per_step']:.2f}, drafts/step {s['drafts_per_step']:.2f}, "
-              f"acceptance {s['acceptance_rate']:.3f}", flush=True)
+              f"acceptance {s['acceptance_rate']:.3f}, copyable {s['copyable_share']:.3f}", flush=True)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
