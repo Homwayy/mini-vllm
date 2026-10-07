@@ -40,14 +40,15 @@ class Scheduler:
         seqs, tokens = [], 0
         while self.waiting and len(self.running) < self.max_num_seqs:
             seq = self.waiting[0]
-            if tokens + len(seq) > self.max_num_batched_tokens or not self.kv.can_admit(seq, len(self.running)):
+            new = len(seq) - self.kv.cached_tokens(seq)  # tokens this prefill computes
+            if tokens + new > self.max_num_batched_tokens or not self.kv.can_admit(seq, len(self.running)):
                 break
             self.waiting.popleft()
             self.kv.admit(seq)
             seq.status = Status.RUNNING
             self.running.append(seq)
             seqs.append(seq)
-            tokens += len(seq)
+            tokens += new
         return seqs
 
     def _decode(self):

@@ -28,6 +28,8 @@ class Sequence:
         self.params = params
         self.status = Status.WAITING
         self.block_table: list[int] = []
+        self.num_cached_tokens = 0  # leading tokens whose K/V came from the prefix cache at admission
+        self.block_hashes: list[int] = []  # prefix hashes of the full blocks, as far as computed
         self.arrival_time = arrival_time
         self.first_token_time = None
         self.finish_time = None

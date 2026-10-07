@@ -87,11 +87,12 @@ class ModelRunner:
         ids, pos, slots, cu = [], [], [], [0]
         block_tables = np.zeros((len(seqs), max(len(seq.block_table) for seq in seqs)), np.int32)
         for i, seq in enumerate(seqs):
-            p = np.arange(len(seq))
-            ids.append(seq.token_ids)
+            # tokens before num_cached_tokens are in shared blocks from the prefix cache
+            p = np.arange(seq.num_cached_tokens, len(seq))
+            ids.append(seq.token_ids[seq.num_cached_tokens :])
             pos.append(p)
             slots.append(np.asarray(seq.block_table)[p // bs] * bs + p % bs)
-            cu.append(cu[-1] + len(seq))
+            cu.append(cu[-1] + len(p))
             block_tables[i, : len(seq.block_table)] = seq.block_table
         meta = AttnMetadata(
             is_prefill=True, slot_mapping=self.to_device(np.concatenate(slots), np.int64), cu_seqlens=cu,

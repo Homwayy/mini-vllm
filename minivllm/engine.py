@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from minivllm.kv_manager import ContiguousKV, PagedKV, cdiv
+from minivllm.kv_manager import ContiguousKV, PagedKV, PrefixCachingKV, cdiv
 from minivllm.model_runner import ModelRunner
 from minivllm.scheduler import Scheduler
 from minivllm.sequence import SamplingParams, Sequence
@@ -19,6 +19,7 @@ class EngineConfig:
     kv: str = "paged"  # "paged", or "contiguous": a fixed max_model_len region per sequence
     admission: str = "reserve"  # paged only: "reserve", "optimistic" or "headroom" (see PagedKV)
     batching: str = "continuous"  # "continuous" or "static"
+    prefix_caching: bool = False  # share full blocks between sequences with the same prefix (paged, triton)
     cuda_graph: bool = True  # capture the decode step per batch-size bucket
     block_size: int = 16
     num_kv_blocks: int = 4096
@@ -40,6 +41,9 @@ class StepRecord:
 
 class LLMEngine:
     def __init__(self, cfg: EngineConfig):
+        # the other backends attend to the new tokens only, so they cannot use a cached prefix
+        if cfg.prefix_caching and (cfg.kv != "paged" or cfg.attention != "triton"):
+            raise ValueError("prefix_caching needs kv='paged' and attention='triton'")
         self.cfg = cfg
         torch.cuda.init()
         cap_gpu_memory()
@@ -50,6 +54,8 @@ class LLMEngine:
         cfg = self.cfg
         if cfg.kv == "contiguous":
             kv = ContiguousKV(cfg.num_kv_blocks, cfg.block_size, cfg.max_model_len)
+        elif cfg.prefix_caching:
+            kv = PrefixCachingKV(cfg.num_kv_blocks, cfg.block_size, cfg.admission)
         else:
             kv = PagedKV(cfg.num_kv_blocks, cfg.block_size, cfg.admission)
         self.kv = kv
@@ -80,7 +86,7 @@ class LLMEngine:
         start = time.perf_counter()
         tokens = self.runner.run(seqs, is_prefill)
         now = time.perf_counter()
-        num_tokens = sum(len(s) for s in seqs) if is_prefill else len(seqs)
+        num_tokens = sum(len(s) - s.num_cached_tokens for s in seqs) if is_prefill else len(seqs)
         kv_used = sum(len(s) for s in self.scheduler.running)
         kv_allocated = self.kv.allocated_slots()
         finished = []

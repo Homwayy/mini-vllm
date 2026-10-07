@@ -5,7 +5,7 @@ W1  offline throughput: 256 requests with random-token prompts of 100-1024 token
 W2  online latency: W1's requests arriving as a Poisson process. Arrival times are stored for a rate of
     1 request/s; for rate r they are divided by r, so every rate replays the same requests in the same order.
 W3  shared prefix: 64 requests sharing a 1000-token prefix, each followed by 50-200 tokens of its own,
-    with 50-200 output tokens.
+    with 50-200 output tokens. Poisson arrival times are stored for a rate of 1 request/s, as for W2.
 
 Run from the repo root: python -m bench.workloads
 """
@@ -48,12 +48,15 @@ def make_w3(rng):
         {"prompt_token_ids": prefix + random_ids(rng, rng.integers(50, 201)), "max_tokens": int(rng.integers(50, 201))}
         for _ in range(n)
     ]
+    gaps = rng.exponential(1.0, n)  # drawn after the requests, which stay as they were before arrivals existed
+    gaps[0] = 0.0
     return {
         "name": "W3",
-        "description": f"{n} requests sharing a {prefix_len}-token prefix",
+        "description": f"{n} requests sharing a {prefix_len}-token prefix; online runs use arrival_times_rate1 / rate",
         "shared_prefix_len": prefix_len,
         "sampling": SAMPLING,
         "requests": requests,
+        "arrival_times_rate1": np.cumsum(gaps).round(6).tolist(),
     }
 
 

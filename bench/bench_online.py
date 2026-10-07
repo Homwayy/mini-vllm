@@ -1,4 +1,5 @@
-"""Online latency (W2): W1's requests arriving as a Poisson process, at several rates.
+"""Online latency: a workload's requests arriving as a Poisson process, at several rates. W2 is W1's requests
+arriving this way; W3 (shared prefix) has arrival times of its own.
 
 Each request is added to the engine once its arrival time has passed, and the engine keeps stepping in
 between. TTFT, TPOT and end-to-end latency are measured from each request's own arrival time, so they
@@ -48,6 +49,7 @@ def main():
     ap.add_argument("--kv", default=d.kv)
     ap.add_argument("--admission", default=d.admission)
     ap.add_argument("--batching", default=d.batching)
+    ap.add_argument("--prefix-caching", action="store_true")
     ap.add_argument("--num-kv-blocks", type=int, default=d.num_kv_blocks)
     ap.add_argument("--max-num-seqs", type=int, default=d.max_num_seqs)
     ap.add_argument("--max-num-batched-tokens", type=int, default=d.max_num_batched_tokens)
@@ -60,7 +62,7 @@ def main():
 
     cfg = EngineConfig(
         model=args.model, attention=args.attention, kv=args.kv, admission=args.admission, batching=args.batching,
-        num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
+        prefix_caching=args.prefix_caching, num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens, max_model_len=args.max_model_len,
     )
     w = load_workload(args.workload)
@@ -86,19 +88,20 @@ def main():
             "first_token_s": [x.first_token_time - t0 for x in seqs],
             "finish_s": [x.finish_time - t0 for x in seqs],
             "preemptions": [x.num_preemptions for x in seqs],
+            "cached_tokens": [x.num_cached_tokens for x in seqs],
         }
         results.append(s)
         print(
             f"rate {rate:g}/s: {s['elapsed_s']:.1f} s, output {s['output_throughput']:.0f} tok/s, "
             f"TTFT p50 {s['ttft_p50_s']:.2f} s p99 {s['ttft_p99_s']:.2f} s, TPOT p50 {s['tpot_p50_ms']:.1f} ms p99 {s['tpot_p99_ms']:.1f} ms, "
-            f"decode batch mean {s['decode_batch_mean']:.1f}, preemptions {s['preemptions']}",
+            f"decode batch mean {s['decode_batch_mean']:.1f}, preemptions {s['preemptions']}, prefix hit rate {s['prefix_hit_rate']:.3f}",
             flush=True,
         )
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
         json.dump({
-            "config": cfg.__dict__, "workload": "W2 (W1 requests, Poisson arrivals)", "num_requests": len(reqs),
+            "config": cfg.__dict__, "workload": f"{w['name']} requests, Poisson arrivals", "num_requests": len(reqs),
             "temperature": temperature, "gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "rates": results,
         }, f, indent=1)
     print("wrote", args.out)

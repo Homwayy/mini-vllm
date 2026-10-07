@@ -9,6 +9,10 @@ after preemption) produces tokens far from the argmax.
 Decode runs in CUDA graphs. Replaying a graph runs the same kernels on the same padded shapes as the eager
 path, so for each policy the eager engine must produce exactly the same tokens.
 
+Prefix caching runs on prompts built from a few shared prefixes: one of exactly 3 blocks (so some prompts
+are entirely cached and their last block is computed again), one of 6 blocks and 4 tokens, and one shorter
+than a block; some prompts are duplicates. A small pool adds preemption and eviction.
+
 Run from the repo root: python -m tests.test_engine
 """
 
@@ -23,6 +27,10 @@ from minivllm.sequence import SamplingParams
 from tests.common import PagedSeqs
 
 MAX_REGRET = 1.0  # bf16 noise moves logits by a few tenths; corrupted K/V gives regrets of several units
+PREFIX_CASES = [
+    dict(kv="paged", admission="reserve", batching="continuous", prefix_caching=True),
+    dict(kv="paged", admission="optimistic", batching="continuous", num_kv_blocks=48, prefix_caching=True),
+]
 CASES = [
     dict(kv="contiguous", batching="static"),
     dict(kv="paged", admission="reserve", batching="static"),
@@ -36,6 +44,15 @@ CASES = [
 def make_requests(n, vocab, max_prompt, max_out, seed=0):
     rng = random.Random(seed)
     prompts = [[rng.randrange(vocab) for _ in range(rng.randint(5, max_prompt))] for _ in range(n)]
+    params = [SamplingParams(temperature=0.0, max_tokens=rng.randint(5, max_out), ignore_eos=True) for _ in range(n)]
+    return prompts, params
+
+
+def shared_prefix_requests(n, vocab, max_out, seed=2):
+    rng = random.Random(seed)
+    prefixes = [[rng.randrange(vocab) for _ in range(k)] for k in (48, 100, 7)]
+    prompts = [rng.choice(prefixes) + [rng.randrange(vocab) for _ in range(rng.choice([0, 0, 1, 16, rng.randint(2, 60)]))]
+               for _ in range(n)]
     params = [SamplingParams(temperature=0.0, max_tokens=rng.randint(5, max_out), ignore_eos=True) for _ in range(n)]
     return prompts, params
 
@@ -76,10 +93,13 @@ def run_case(engine, prompts, params, label):
     prefills = sum(r.is_prefill for r in engine.steps)
     max_batch = max(r.num_seqs for r in engine.steps if not r.is_prefill)
     ok = lengths_ok and released and regret <= MAX_REGRET
+    cached = sum(s.num_cached_tokens for s in seqs)
+    if engine.cfg.prefix_caching:
+        ok &= cached > 0
     print(
         f"{label:58s} regret max {regret:.3f}, exact argmax {exact:.3f}, preemptions {engine.scheduler.num_preemptions:3d}, "
         f"prefill steps {prefills:3d}, max decode batch {max_batch:2d}, lengths {'ok' if lengths_ok else 'WRONG'}, "
-        f"KV {'released' if released else 'LEAKED'}"
+        f"KV {'released' if released else 'LEAKED'}" + (f", cached prompt tokens {cached}" if engine.cfg.prefix_caching else "")
     )
     graph_tokens = [s.token_ids for s in seqs]
     engine.reset()
@@ -108,6 +128,11 @@ def main():
     sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
     print(f"qwen3 {cfg.attention} sampling (temperature 0.6, top_p 0.9): lengths {'ok' if sample_ok else 'WRONG'}")
     ok &= sample_ok
+    shared, shared_params = shared_prefix_requests(24, 10000, 80)
+    for case in PREFIX_CASES:
+        engine.cfg = EngineConfig(**{**cfg.__dict__, **case})
+        engine.reset()
+        ok &= run_case(engine, shared, shared_params, f"qwen3 {cfg.attention} {case}")
     del engine
     torch.cuda.empty_cache()
 
@@ -127,6 +152,11 @@ def main():
         engine.cfg = EngineConfig(**{**gcfg.__dict__, **case})
         engine.reset()
         ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case}")
+    shared, shared_params = shared_prefix_requests(24, 50257, 80, seed=3)
+    for case in PREFIX_CASES:
+        engine.cfg = EngineConfig(**{**gcfg.__dict__, **case})
+        engine.reset()
+        ok &= run_case(engine, shared, shared_params, f"gpt2 {gcfg.attention} {case}")
     del engine
     torch.cuda.empty_cache()
     engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "flex"}))
