@@ -27,6 +27,9 @@ class ContiguousKV:
     def cached_tokens(self, seq: Sequence):
         return 0
 
+    def computed(self, seq: Sequence, start, end):
+        """The step being scheduled computes seq's tokens start .. end - 1 (only the prefix cache uses this)."""
+
     def can_admit(self, seq: Sequence, num_running: int):
         return bool(self.free_regions)
 
@@ -71,6 +74,9 @@ class PagedKV:
     def cached_tokens(self, seq: Sequence):
         return 0
 
+    def computed(self, seq: Sequence, start, end):
+        """The step being scheduled computes seq's tokens start .. end - 1 (only the prefix cache uses this)."""
+
     def can_admit(self, seq: Sequence, num_running: int):
         if self.admission == "reserve":
             return self.reserved + cdiv(seq.max_len, self.block_size) <= self.num_blocks
@@ -111,9 +117,9 @@ class PrefixCachingKV(PagedKV):
     the start of a sequence, and only its other tokens are computed. At least the last token is always
     computed, since its logits give the next token.
 
-    A block is entered in the cache when the step that computes it is scheduled. Every layer writes the
-    step's K/V into the pool before attention reads it, so a sequence admitted in the same step can
-    already share it.
+    A block is entered in the cache when the step that computes it is scheduled (computed()). Every layer
+    writes the step's K/V into the pool before attention reads it, so a sequence scheduled later in the
+    same step can already share it.
 
     reserve counts each held block once, plus the blocks that running sequences may still allocate, so
     shared blocks are not reserved twice.
@@ -172,16 +178,15 @@ class PrefixCachingKV(PagedKV):
         self._allocate(seq)
         if self.admission == "reserve":
             self.future += cdiv(seq.max_len, self.block_size) - len(seq.block_table)
-        # this prefill computes all of seq's other tokens
-        self._register(seq, len(hits), len(seq) // self.block_size)
 
     def append(self, seq: Sequence):
         n = self._allocate(seq)
         if self.admission == "reserve":
             self.future -= n
-        # the decode step computes the last token; if that fills its block, the block can be shared
-        if len(seq) % self.block_size == 0:
-            self._register(seq, len(seq) // self.block_size - 1, len(seq) // self.block_size)
+
+    def computed(self, seq: Sequence, start, end):
+        """The step being scheduled computes seq's tokens start .. end - 1: their full blocks can be shared."""
+        self._register(seq, start // self.block_size, end // self.block_size)
 
     def release(self, seq: Sequence):
         if self.admission == "reserve":

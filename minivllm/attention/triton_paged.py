@@ -275,21 +275,19 @@ def prefill_block_m(max_new_tokens, group_pad):
 
 
 class PagedPrefill:
-    def __init__(self, block_n=32, num_warps=4, num_stages=2, block_m=None):
+    def __init__(self, block_n=32, num_warps=4, num_stages=2):
         self.block_n, self.num_warps, self.num_stages = block_n, num_warps, num_stages
-        self.block_m = block_m  # None picks it from the most new tokens of any sequence
 
-    def __call__(self, q, k_cache, v_cache, block_tables, cu_seqlens, seq_lens, max_new_tokens):
+    def __call__(self, q, k_cache, v_cache, block_tables, cu_seqlens, seq_lens, block_m):
         """q [T, Hq, D]: the new tokens of all sequences, packed; their K/V must already be in the pools.
 
         cu_seqlens [B + 1] int32 holds the prefix sums of the new-token counts, seq_lens [B] int32 each
-        sequence's length including its new tokens.
+        sequence's length including its new tokens; block_m is the number of rows per tile.
         """
         T, Hq, D = q.shape
         _, page, Hkv, _ = k_cache.shape
         group = Hq // Hkv
         group_pad = triton.next_power_of_2(group)
-        block_m = self.block_m or prefill_block_m(max_new_tokens, group_pad)
         B = seq_lens.shape[0]
         out = torch.empty_like(q, memory_format=torch.contiguous_format)
         _prefill_kernel[(T // (block_m // group_pad) + B, Hkv)](
@@ -310,6 +308,8 @@ class TritonAttention:
     """Prefill and decode with the Triton paged kernels.
 
     With flex_prefill, prefill uses FlexAttention over the new tokens instead (the setup measured in E4).
+    For prefill, meta.backend_state may hold (cu_seqlens on the GPU, rows per tile) already, as in the
+    CUDA graphs of chunked prefill; otherwise both are worked out from meta.cu_seqlens.
     """
 
     def __init__(self, block_size, max_num_batched_tokens, max_num_seqs, device, flex_prefill=False):
@@ -324,7 +324,9 @@ class TritonAttention:
             if meta.backend_state is None:
                 cu = meta.cu_seqlens
                 max_new = max(b - a for a, b in zip(cu[:-1], cu[1:]))
-                meta.backend_state = (torch.tensor(cu, dtype=torch.int32, device=q.device), max_new)
-            cu, max_new = meta.backend_state
-            return self.prefill(q, k_cache, v_cache, meta.block_tables, cu, meta.context_lens, max_new)
+                group_pad = triton.next_power_of_2(q.shape[1] // k_cache.shape[2])
+                meta.backend_state = (torch.tensor(cu, dtype=torch.int32, device=q.device),
+                                      prefill_block_m(max_new, group_pad))
+            cu, block_m = meta.backend_state
+            return self.prefill(q, k_cache, v_cache, meta.block_tables, cu, meta.context_lens, block_m)
         return self.decode(q, k_cache, v_cache, meta.block_tables, meta.context_lens)

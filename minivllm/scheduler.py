@@ -1,8 +1,13 @@
-"""Decides which sequences run in each step. A step is either all prefill or all decode.
+"""Decides which sequences run in each step.
 
 Static batching: a batch is filled from the waiting queue, then decodes until every sequence in it has
 finished; only then is the next batch formed. Continuous batching: waiting sequences are admitted at every
-step as soon as they fit, and new prefills take priority over decoding.
+step as soon as they fit, and new prefills take priority over decoding. In both, a step is either all
+prefill or all decode.
+
+Chunked prefill (continuous only): every step has a budget of max_num_batched_tokens. Sequences that are
+decoding go first, one token each, so a long prompt never holds them up; the rest of the budget continues
+partly computed prompts in admission order, then admits new ones, the last of which may be cut short.
 """
 
 from collections import deque
@@ -45,6 +50,7 @@ class Scheduler:
                 break
             self.waiting.popleft()
             self.kv.admit(seq)
+            self.kv.computed(seq, seq.num_cached_tokens, len(seq))  # the prefill computes all other tokens
             seq.status = Status.RUNNING
             self.running.append(seq)
             seqs.append(seq)
@@ -57,6 +63,7 @@ class Scheduler:
             seq = self.running[i]
             if self.kv.can_append(seq):
                 self.kv.append(seq)
+                self.kv.computed(seq, len(seq) - 1, len(seq))
                 scheduled.append(seq)
                 i += 1
                 continue
@@ -67,8 +74,53 @@ class Scheduler:
                 break
         return scheduled
 
+    def schedule_chunked(self):
+        """Returns [(sequence, number of its next tokens to compute)] for one step."""
+        plan = []
+
+        def add(seq, n):
+            # entered now, so that sequences scheduled after it in this step can share its new blocks
+            self.kv.computed(seq, seq.num_computed_tokens, seq.num_computed_tokens + n)
+            plan.append((seq, n))
+
+        # sequences with one token left to compute: decoding, or about to finish their prompt
+        i = 0
+        while i < len(self.running):
+            seq = self.running[i]
+            if len(seq) - seq.num_computed_tokens > 1:  # a prompt in progress; its blocks came with admission
+                i += 1
+                continue
+            if self.kv.can_append(seq):
+                self.kv.append(seq)
+                add(seq, 1)
+                i += 1
+                continue
+            victim = self.running.pop()  # out of blocks: preempt the most recently admitted sequence
+            self._preempt(victim)
+            if victim is seq:
+                break
+        budget = self.max_num_batched_tokens - len(plan)
+        for seq in self.running:
+            left = len(seq) - seq.num_computed_tokens
+            if left > 1 and budget > 0:
+                add(seq, min(left, budget))
+                budget -= plan[-1][1]
+        while self.waiting and budget > 0 and len(self.running) < self.max_num_seqs:
+            seq = self.waiting[0]
+            if not self.kv.can_admit(seq, len(self.running)):
+                break
+            self.waiting.popleft()
+            self.kv.admit(seq)
+            seq.status = Status.RUNNING
+            seq.num_computed_tokens = seq.num_cached_tokens
+            self.running.append(seq)
+            add(seq, min(len(seq) - seq.num_computed_tokens, budget))
+            budget -= plan[-1][1]
+        return plan
+
     def _preempt(self, seq: Sequence):
         self.kv.release(seq)
+        seq.num_computed_tokens = 0
         seq.status = Status.WAITING
         seq.num_preemptions += 1
         self.num_preemptions += 1

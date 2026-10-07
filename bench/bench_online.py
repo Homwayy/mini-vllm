@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--admission", default=d.admission)
     ap.add_argument("--batching", default=d.batching)
     ap.add_argument("--prefix-caching", action="store_true")
+    ap.add_argument("--chunked-prefill", action="store_true", help="mix prompt chunks with decoding; budget is --max-num-batched-tokens")
     ap.add_argument("--num-kv-blocks", type=int, default=d.num_kv_blocks)
     ap.add_argument("--max-num-seqs", type=int, default=d.max_num_seqs)
     ap.add_argument("--max-num-batched-tokens", type=int, default=d.max_num_batched_tokens)
@@ -62,7 +63,8 @@ def main():
 
     cfg = EngineConfig(
         model=args.model, attention=args.attention, kv=args.kv, admission=args.admission, batching=args.batching,
-        prefix_caching=args.prefix_caching, num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
+        prefix_caching=args.prefix_caching, chunked_prefill=args.chunked_prefill,
+        num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens, max_model_len=args.max_model_len,
     )
     w = load_workload(args.workload)
@@ -94,6 +96,7 @@ def main():
         print(
             f"rate {rate:g}/s: {s['elapsed_s']:.1f} s, output {s['output_throughput']:.0f} tok/s, "
             f"TTFT p50 {s['ttft_p50_s']:.2f} s p99 {s['ttft_p99_s']:.2f} s, TPOT p50 {s['tpot_p50_ms']:.1f} ms p99 {s['tpot_p99_ms']:.1f} ms, "
+            f"ITL p99 {s['itl_p99_ms']:.1f} ms max {s['itl_max_ms']:.0f} ms, "
             f"decode batch mean {s['decode_batch_mean']:.1f}, preemptions {s['preemptions']}, prefix hit rate {s['prefix_hit_rate']:.3f}",
             flush=True,
         )

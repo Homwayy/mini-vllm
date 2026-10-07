@@ -13,6 +13,10 @@ Prefix caching runs on prompts built from a few shared prefixes: one of exactly 
 are entirely cached and their last block is computed again), one of 6 blocks and 4 tokens, and one shorter
 than a block; some prompts are duplicates. A small pool adds preemption and eviction.
 
+Chunked prefill runs with a budget of 64 tokens per step, so prompts of up to 300 tokens are split into
+several chunks and mixed with decoding; mixed steps run in CUDA graphs too, so the eager comparison covers
+them. A small pool preempts sequences in the middle of their prompts.
+
 Run from the repo root: python -m tests.test_engine
 """
 
@@ -30,6 +34,10 @@ MAX_REGRET = 1.0  # bf16 noise moves logits by a few tenths; corrupted K/V gives
 PREFIX_CASES = [
     dict(kv="paged", admission="reserve", batching="continuous", prefix_caching=True),
     dict(kv="paged", admission="optimistic", batching="continuous", num_kv_blocks=48, prefix_caching=True),
+]
+CHUNKED_CASES = [
+    dict(kv="paged", admission="reserve", batching="continuous", chunked_prefill=True),
+    dict(kv="paged", admission="optimistic", batching="continuous", num_kv_blocks=48, chunked_prefill=True),
 ]
 CASES = [
     dict(kv="contiguous", batching="static"),
@@ -91,15 +99,19 @@ def run_case(engine, prompts, params, label):
     lengths_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, params))
     released = engine.kv.allocated_slots() == 0
     prefills = sum(r.is_prefill for r in engine.steps)
-    max_batch = max(r.num_seqs for r in engine.steps if not r.is_prefill)
+    max_batch = max(r.num_decode for r in engine.steps)
     ok = lengths_ok and released and regret <= MAX_REGRET
     cached = sum(s.num_cached_tokens for s in seqs)
+    mixed = sum(r.is_prefill and r.num_decode > 0 for r in engine.steps)
     if engine.cfg.prefix_caching:
         ok &= cached > 0
+    if engine.cfg.chunked_prefill:
+        ok &= mixed > 0
     print(
         f"{label:58s} regret max {regret:.3f}, exact argmax {exact:.3f}, preemptions {engine.scheduler.num_preemptions:3d}, "
         f"prefill steps {prefills:3d}, max decode batch {max_batch:2d}, lengths {'ok' if lengths_ok else 'WRONG'}, "
         f"KV {'released' if released else 'LEAKED'}" + (f", cached prompt tokens {cached}" if engine.cfg.prefix_caching else "")
+        + (f", mixed steps {mixed}" if engine.cfg.chunked_prefill else "")
     )
     graph_tokens = [s.token_ids for s in seqs]
     engine.reset()
@@ -136,6 +148,18 @@ def main():
     del engine
     torch.cuda.empty_cache()
 
+    chunked_cfg = EngineConfig(**{**cfg.__dict__, "chunked_prefill": True, "max_num_batched_tokens": 64})
+    engine = LLMEngine(chunked_cfg)
+    for case in CHUNKED_CASES:
+        engine.cfg = EngineConfig(**{**chunked_cfg.__dict__, **case})
+        engine.reset()
+        ok &= run_case(engine, prompts, params, f"qwen3 {cfg.attention} {case} budget 64")
+    engine.cfg = EngineConfig(**{**chunked_cfg.__dict__, **PREFIX_CASES[0], "chunked_prefill": True})
+    engine.reset()
+    ok &= run_case(engine, shared, shared_params, f"qwen3 {cfg.attention} prefix caching + chunked, budget 64")
+    del engine
+    torch.cuda.empty_cache()
+
     for attention in ("gather", "flex"):
         engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "attention": attention}))
         ok &= run_case(engine, prompts, params, f"qwen3 {attention} {{'kv': 'paged', 'batching': 'continuous'}}")
@@ -157,6 +181,10 @@ def main():
         engine.cfg = EngineConfig(**{**gcfg.__dict__, **case})
         engine.reset()
         ok &= run_case(engine, shared, shared_params, f"gpt2 {gcfg.attention} {case}")
+    del engine
+    torch.cuda.empty_cache()
+    engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "chunked_prefill": True, "max_num_batched_tokens": 64}))
+    ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {CHUNKED_CASES[0]} budget 64")
     del engine
     torch.cuda.empty_cache()
     engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "flex"}))
