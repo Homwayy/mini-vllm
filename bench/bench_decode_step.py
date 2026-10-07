@@ -23,7 +23,7 @@ PROMPT_LEN = 1024
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--attention", default="flex")
+    ap.add_argument("--attention", default=EngineConfig().attention)
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 48])
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--max-num-seqs", type=int, default=256, help="largest decode graph; gather needs 64 to fit in memory")

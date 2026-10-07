@@ -99,19 +99,19 @@ def main():
     for case in CASES:
         engine.cfg = EngineConfig(**{**cfg.__dict__, **case})
         engine.reset()
-        ok &= run_case(engine, prompts, params, f"qwen3 flex {case}")
+        ok &= run_case(engine, prompts, params, f"qwen3 {cfg.attention} {case}")
     # sampling path: lengths only
     engine.cfg = cfg
     engine.reset()
     sampled = [SamplingParams(temperature=0.6, top_p=0.9, max_tokens=p.max_tokens, ignore_eos=True) for p in params]
     seqs = engine.generate(prompts, sampled)
     sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
-    print(f"qwen3 flex sampling (temperature 0.6, top_p 0.9): lengths {'ok' if sample_ok else 'WRONG'}")
+    print(f"qwen3 {cfg.attention} sampling (temperature 0.6, top_p 0.9): lengths {'ok' if sample_ok else 'WRONG'}")
     ok &= sample_ok
     del engine
     torch.cuda.empty_cache()
 
-    for attention in ("gather", "triton"):
+    for attention in ("gather", "flex"):
         engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "attention": attention}))
         ok &= run_case(engine, prompts, params, f"qwen3 {attention} {{'kv': 'paged', 'batching': 'continuous'}}")
         engine.cfg = EngineConfig(**{**engine.cfg.__dict__, **CASES[4]})
@@ -126,11 +126,11 @@ def main():
     for case in (CASES[2], CASES[4]):
         engine.cfg = EngineConfig(**{**gcfg.__dict__, **case})
         engine.reset()
-        ok &= run_case(engine, prompts, params, f"gpt2 flex {case}")
+        ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case}")
     del engine
     torch.cuda.empty_cache()
-    engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "triton"}))
-    ok &= run_case(engine, prompts, params, "gpt2 triton {'kv': 'paged', 'batching': 'continuous'}")
+    engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "flex"}))
+    ok &= run_case(engine, prompts, params, "gpt2 flex {'kv': 'paged', 'batching': 'continuous'}")
     print("PASS" if ok else "FAIL")
 
 

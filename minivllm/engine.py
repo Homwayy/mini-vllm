@@ -14,7 +14,7 @@ from minivllm.utils import cap_gpu_memory
 class EngineConfig:
     model: str = "qwen3"  # "qwen3" or "gpt2"
     model_path: str | None = None
-    attention: str = "flex"  # "flex", "triton" (Triton decode, flex prefill) or "gather"
+    attention: str = "triton"  # "triton" (Triton decode, flex prefill), "flex" or "gather"
     kv: str = "paged"  # "paged", or "contiguous": a fixed max_model_len region per sequence
     admission: str = "reserve"  # paged only: "reserve", "optimistic" or "headroom" (see PagedKV)
     batching: str = "continuous"  # "continuous" or "static"
