@@ -11,7 +11,7 @@ the same model without autocast gives the fp32 reference.
    matmuls have more rows and cuBLAS may pick different kernels, so small differences there are expected.
    Other backends are judged by their errors against the fp32 reference.
 
-Run from the repo root: python -m tests.test_gpt2_nanogpt [--attn gather|flex]
+Run from the repo root: python -m tests.test_gpt2_nanogpt [--attn gather|flex|triton|triton-decode]
 """
 
 import json

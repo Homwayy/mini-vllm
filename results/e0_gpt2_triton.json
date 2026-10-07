@@ -53,13 +53,13 @@
       "prompt_len": 120,
       "prefill_ours_vs_nano_bf16": {
         "max_abs_err": 0.0625,
-        "mean_abs_err": 0.004579870030283928,
+        "mean_abs_err": 0.004697224125266075,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
       "prefill_ours_vs_fp32": {
         "max_abs_err": 0.0678110122680664,
-        "mean_abs_err": 0.008726341649889946,
+        "mean_abs_err": 0.008736453019082546,
         "argmax_agree": 0.9916667342185974,
         "max_fp32_regret": 0.028273582458496094
       },
@@ -71,14 +71,14 @@
       },
       "prefill_bitwise_equal_to_nano_bf16": false,
       "decode_ours_vs_nano_bf16": {
-        "max_abs_err": 0.125,
-        "mean_abs_err": 0.007129095960408449,
+        "max_abs_err": 0.0625,
+        "mean_abs_err": 0.006913692690432072,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
       "decode_ours_vs_fp32": {
-        "max_abs_err": 0.08574962615966797,
-        "mean_abs_err": 0.009451366029679775,
+        "max_abs_err": 0.07102489471435547,
+        "mean_abs_err": 0.009369486942887306,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
@@ -97,15 +97,15 @@
       "prompt_len": 517,
       "prefill_ours_vs_nano_bf16": {
         "max_abs_err": 0.0625,
-        "mean_abs_err": 0.005170333664864302,
-        "argmax_agree": 1.0,
+        "mean_abs_err": 0.005014658439904451,
+        "argmax_agree": 0.9980657696723938,
         "max_fp32_regret": 0.0
       },
       "prefill_ours_vs_fp32": {
-        "max_abs_err": 0.07791519165039062,
-        "mean_abs_err": 0.008625930175185204,
-        "argmax_agree": 0.9845261573791504,
-        "max_fp32_regret": 0.049757957458496094
+        "max_abs_err": 0.07403230667114258,
+        "mean_abs_err": 0.008564014919102192,
+        "argmax_agree": 0.9864603877067566,
+        "max_fp32_regret": 0.048356056213378906
       },
       "prefill_nano_bf16_vs_fp32": {
         "max_abs_err": 0.07026481628417969,
@@ -116,13 +116,13 @@
       "prefill_bitwise_equal_to_nano_bf16": false,
       "decode_ours_vs_nano_bf16": {
         "max_abs_err": 0.0625,
-        "mean_abs_err": 0.006306259892880917,
+        "mean_abs_err": 0.006219560746103525,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
       "decode_ours_vs_fp32": {
-        "max_abs_err": 0.08470392227172852,
-        "mean_abs_err": 0.009459823369979858,
+        "max_abs_err": 0.08321762084960938,
+        "mean_abs_err": 0.009413323365151882,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
@@ -141,15 +141,15 @@
       "prompt_len": 896,
       "prefill_ours_vs_nano_bf16": {
         "max_abs_err": 0.125,
-        "mean_abs_err": 0.005439911503344774,
+        "mean_abs_err": 0.005358668975532055,
         "argmax_agree": 0.996651828289032,
         "max_fp32_regret": 0.0625
       },
       "prefill_ours_vs_fp32": {
-        "max_abs_err": 0.07982826232910156,
-        "mean_abs_err": 0.008655376732349396,
+        "max_abs_err": 0.08232545852661133,
+        "mean_abs_err": 0.008614088408648968,
         "argmax_agree": 0.981026828289032,
-        "max_fp32_regret": 0.036655426025390625
+        "max_fp32_regret": 0.05166435241699219
       },
       "prefill_nano_bf16_vs_fp32": {
         "max_abs_err": 0.08061790466308594,
@@ -160,13 +160,13 @@
       "prefill_bitwise_equal_to_nano_bf16": false,
       "decode_ours_vs_nano_bf16": {
         "max_abs_err": 0.125,
-        "mean_abs_err": 0.006507210899144411,
+        "mean_abs_err": 0.006496363319456577,
         "argmax_agree": 1.0,
         "max_fp32_regret": 0.0
       },
       "decode_ours_vs_fp32": {
-        "max_abs_err": 0.06434249877929688,
-        "mean_abs_err": 0.00896895956248045,
+        "max_abs_err": 0.06827354431152344,
+        "mean_abs_err": 0.008866733871400356,
         "argmax_agree": 0.9921875,
         "max_fp32_regret": 0.026711463928222656
       },

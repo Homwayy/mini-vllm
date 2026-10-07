@@ -5,7 +5,7 @@
 2. Greedy decoding: our batched decode vs HF's bf16 decode, token by token.
 3. Teacher forcing: our per-step decode logits vs the fp32 reference on the same tokens.
 
-Run from the repo root: python -m tests.test_qwen3_hf [--attn gather|flex]
+Run from the repo root: python -m tests.test_qwen3_hf [--attn gather|flex|triton|triton-decode]
 """
 
 import json

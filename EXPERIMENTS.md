@@ -65,7 +65,8 @@
 - **其他固定设置：** 每一步要么全是 prefill，要么全是 decode；prefill 每步最多 16,384 个 token；最多同时运行 256 条序列；max_model_len 2048。
 - **注意力：** 三种实现，用 `attention` 切换：
   - `attention=flex`：FlexAttention。prefill 一次处理打平的多条序列（document mask），decode 按 block table 直接读 KV 池，见 3.1。E1–E3 用它。
-  - `attention=triton`：decode 用自己写的 Triton 分页注意力（见 3.5），prefill 仍用 FlexAttention。E4 以后用它。
+  - `attention=triton`：prefill 和 decode 都用自己写的 Triton 分页注意力（见 3.5）。prefill 的 K/V 也全部从池里读，所以能接在已经缓存的前缀后面。
+  - `attention=triton-decode`：decode 用 Triton，prefill 用 FlexAttention，是 E4 测的配置（E4 时它叫 `triton`）。
   - `attention=gather`：把每条序列的 KV 从池里拷出来、补齐，再调用 SDPA，只作为正确性和性能的参照。
 - **CUDA graph：** decode 按 batch 大小分桶（1、2、4、8，再从 16 到 256 每隔 16 一个，共 20 个）录图，batch 补齐到桶的大小，见 3.2。
 - **采样：** 每条请求可以有自己的 temperature、top-k 和 top-p。
@@ -109,7 +110,7 @@
 | E3 | 2026-10-07 | `4089c27` | `kv=paged`，`admission=reserve`，`batching=continuous` | 2605 token/s（对照组 2246、2270） | 46.0 / 60 | 0.992 | 0.644 | 8.61 GiB |
 | E3b | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=optimistic` | 2571、2575 token/s（对照组 2620、2609） | 62.5 / 116 | 0.992 | 0.862 | 8.61 GiB |
 | E3c | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=headroom` | **2719 token/s**（对照组 2571、2575） | 61.9 / 113 | 0.992 | 0.854 | 8.61 GiB |
-| E4 | 2026-10-07 | `dc8c94d` | E3 的配置，`attention=triton` | 2587 token/s（对照组 2555、2557） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
+| E4 | 2026-10-07 | `dc8c94d` | E3 的配置，`attention=triton-decode`（当时叫 `triton`） | 2587 token/s（对照组 2555、2557） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
@@ -129,13 +130,14 @@
 |---|---|---|---|
 | 我们的模型，gather 注意力 | 0.037–0.049 | 0.032–0.039 | 0.19 / 0.077 |
 | 我们的模型，flex 注意力 | 0.037–0.049 | 0.035–0.043 | 0.19 / 0.085 |
-| 我们的模型，Triton 注意力（只换 decode） | 0.037–0.049 | 0.035–0.048 | 0.19 / 0.085 |
+| 我们的模型，Triton 注意力，只换 decode（`triton-decode`） | 0.037–0.049 | 0.035–0.048 | 0.19 / 0.085 |
+| 我们的模型，Triton 注意力，prefill 和 decode（`triton`） | 0.037–0.049 | 0.033–0.047 | 0.19 / 0.12 |
 | HF 的 bf16 模型 | 0.036–0.049 | 0.032–0.042 | 0.19 / 0.10 |
 
 - **误差和 HF 自己的 bf16 同一水平。** 单个位置的最大误差偶尔超过 1，HF 的 bf16 也一样（最大 1.66），所以看平均误差和遗憾值。
 - **Triton 的 decode 误差上限略高：**
-  - 在同一条生成序列上和 HF 的 bf16 比，4 条 prompt 中有 2 条高 12–14%（最高 0.048 对 0.042），另外 2 条相差不到 2%。
-  - 遗憾值和 HF 的 bf16 完全相同。
+  - `triton-decode`：在同一条生成序列上和 HF 的 bf16 比，4 条 prompt 中有 2 条高 12–14%（最高 0.048 对 0.042），另外 2 条相差不到 2%；遗憾值和 HF 的 bf16 完全相同。
+  - `triton`：有 1 条高 13%（0.047 对 0.042），另外 3 条不比 HF 高；decode 的最大遗憾值 0.124，比 bf16 在这个区间的最小间隔 0.125 还小，也就是在打平的两个候选里选了另一个。
   - 单次注意力调用的误差和 flex 相同（见 3.5），推测是个别位置的小差别经过 28 层放大了。
 - **贪心生成不是逐 token 一致：**
   - 和 HF 的 bf16 相比，分歧出现在第 1–33 个 token。flex 和 Triton 注意力下，都有同一条 prompt 的 64 个 token 完全相同。
@@ -148,9 +150,10 @@
   - 每条 prompt 单独跑时，4 条的 prefill logits 都和 nanoGPT 逐位相同，贪心生成的 128 个 token 也完全相同。
   - 4 条打包在一起跑时，3 条仍然逐位相同；17 个 token 的那条有微小的差别（最大 0.0625），在一个 top-2 差距为 0 的位置分岔了。
 - **flex 注意力：** 注意力的 kernel 和 nanoGPT 不同，不再逐位相同，但误差和 nanoGPT 自己的 bf16 同一水平：相对 fp32 的平均误差是 0.0081–0.0095，nanoGPT 是 0.0082–0.0094。打包时 4 条的 128 个 token 全部和 nanoGPT 相同，单独跑时 4 条中有 3 条相同。
-- **Triton 注意力（只换 decode）：**
-  - decode 相对 fp32 的平均误差是 0.0090–0.0095，nanoGPT 在同样的序列上是 0.0086–0.0091。
-  - 打包和单独跑时，都是 4 条中有 3 条的 128 个 token 和 nanoGPT 相同。
+- **Triton 注意力：**
+  - `triton-decode`：decode 相对 fp32 的平均误差是 0.0090–0.0095，nanoGPT 在同样的序列上是 0.0086–0.0091。
+  - `triton`：prefill 是 0.0081–0.0087（nanoGPT 0.0082–0.0087），decode 是 0.0089–0.0094。
+  - 两种配置下，打包和单独跑时，都是 4 条中有 3 条的 128 个 token 和 nanoGPT 相同。
 
 **批不变性：** 上面 17 个 token 那条单独跑时和 nanoGPT 逐位相同，和别的序列打包以后就不同了。打包后矩阵乘法从 17 行变成 1550 行，cuBLAS 选了不同的 kernel，累加顺序随之改变。在连续批处理的引擎里，同一条请求的输出会随同一批里的其他请求变化；这在贪心解码下表现为偶尔在打平的位置分岔。
 
@@ -329,7 +332,7 @@
 
 ### E4：注意力实现（消融）
 
-- **改动：** 在 E3 的引擎上（分页 KV，`admission=reserve`，连续批处理），只把 decode 的注意力从 FlexAttention 换成自己用 Triton 写的分页注意力（`attention=triton`，[minivllm/attention/triton_paged.py](minivllm/attention/triton_paged.py)，设计见 3.5）。prefill 两边都是 FlexAttention。
+- **改动：** 在 E3 的引擎上（分页 KV，`admission=reserve`，连续批处理），只把 decode 的注意力从 FlexAttention 换成自己用 Triton 写的分页注意力（[minivllm/attention/triton_paged.py](minivllm/attention/triton_paged.py)，设计见 3.5）。prefill 两边都是 FlexAttention。这个配置当时叫 `attention=triton`，现在叫 `triton-decode`；下表和结果文件里的 Triton 都是它。
 - **朴素的参照（gather）：** 把每条序列的 K/V 从池里拷到补齐成 2048 个 token 的张量里，再调用 SDPA。
 - **测了三层：**
   - **单层注意力**（[bench/bench_attention.py](bench/bench_attention.py)）：Qwen3 的形状（16 个 query 头、8 个 KV 头、head_dim 128），只跑 decode 注意力。
@@ -449,7 +452,7 @@
 
 - **收益集中在小 batch：** 自己写的分页 decode kernel 在 batch 1 时比 FlexAttention 快 7 倍，原因是 flex 按整个池的长度切分工作；batch ≥ 16 时，两者都接近显存带宽。所以在线、低负载时 TPOT 降低 19–26%，离线的 W1 只多 1.2%。
 - **W1 再要变快只能少读：** W1 的 decode 已经被读 K/V 的带宽限制。batch 48 时，注意力约占每步的 58%（345.9 µs × 28 层 = 9.7 ms，每步 16.84 ms），要再快，只能少读 K/V（例如把 KV 量化）。
-- **后面的实验改用 `attention=triton`。** prefill 目前还是 flex，只看这一步新来的 token；E6（前缀缓存）和 E7（分块 prefill）需要 prefill 也读池里已有的 KV，会把这个 kernel 扩展到每条序列多个 query token。
+- **后面的实验改用 Triton 的 decode。** 当时 prefill 还是 flex，只看这一步新来的 token；E6（前缀缓存）和 E7（分块 prefill）需要 prefill 也读池里已有的 KV，所以接着把 prefill 也换成了 Triton（E4b）。
 
 ## 3. 工程记录与设计决策
 

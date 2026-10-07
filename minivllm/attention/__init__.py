@@ -11,10 +11,10 @@ class AttnMetadata:
     slot_mapping: torch.Tensor  # [T] int64, pool slot that each new token's K/V is written to
     # prefill
     cu_seqlens: list[int] | None = None  # prefix sums of per-sequence new-token counts
-    # decode
+    # paged attention: decode, and prefill in the Triton backend
     block_tables: torch.Tensor | None = None  # [B, max_blocks] int32
     context_lens: torch.Tensor | None = None  # [B] int32, cached tokens including this step's
-    max_context_len: int = 0
+    max_context_len: int = 0  # decode only
     # built by the attention backend on its first call in a step, then shared by all layers
     backend_state: object = None
 

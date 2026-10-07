@@ -25,12 +25,12 @@ def val_documents(n_tokens=2_000_000):
 
 def attention_from_args(block_size, max_tokens, max_seqs, device):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attn", choices=["gather", "flex", "triton"], default="gather")
+    parser.add_argument("--attn", choices=["gather", "flex", "triton", "triton-decode"], default="gather")
     name = parser.parse_args().attn
     if name == "gather":
         return name, GatherAttention()
-    if name == "triton":
-        return name, TritonAttention(block_size, max_tokens, max_seqs, device)
+    if name.startswith("triton"):
+        return name, TritonAttention(block_size, max_tokens, max_seqs, device, flex_prefill=name == "triton-decode")
     return name, FlexAttention(block_size, max_tokens, max_seqs, device)
 
 
@@ -87,7 +87,10 @@ def run_ours(model, prompts, new_tokens, block_size, device):
     cu = [0]
     for n in lens:
         cu.append(cu[-1] + n)
-    meta = AttnMetadata(is_prefill=True, slot_mapping=seqs.slots(seq_idx, positions), cu_seqlens=cu)
+    meta = AttnMetadata(
+        is_prefill=True, slot_mapping=seqs.slots(seq_idx, positions), cu_seqlens=cu, block_tables=seqs.block_tables,
+        context_lens=torch.tensor(lens, dtype=torch.int32, device=device),
+    )
     hidden = model(input_ids, positions, meta)
 
     last = model.compute_logits(hidden[torch.tensor(cu[1:], device=device) - 1]).float()

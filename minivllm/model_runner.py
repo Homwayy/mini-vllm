@@ -40,8 +40,9 @@ class ModelRunner:
         info = MODELS[cfg.model]
         if cfg.attention == "flex":
             attn = FlexAttention(cfg.block_size, cfg.max_num_batched_tokens, cfg.max_num_seqs, device)
-        elif cfg.attention == "triton":
-            attn = TritonAttention(cfg.block_size, cfg.max_num_batched_tokens, cfg.max_num_seqs, device)
+        elif cfg.attention in ("triton", "triton-decode"):
+            attn = TritonAttention(cfg.block_size, cfg.max_num_batched_tokens, cfg.max_num_seqs, device,
+                                   flex_prefill=cfg.attention == "triton-decode")
         elif cfg.attention == "gather":
             attn = GatherAttention()
         else:
@@ -84,13 +85,19 @@ class ModelRunner:
     def prepare_prefill(self, seqs: list[Sequence]):
         bs = self.cfg.block_size
         ids, pos, slots, cu = [], [], [], [0]
-        for seq in seqs:
+        block_tables = np.zeros((len(seqs), max(len(seq.block_table) for seq in seqs)), np.int32)
+        for i, seq in enumerate(seqs):
             p = np.arange(len(seq))
             ids.append(seq.token_ids)
             pos.append(p)
             slots.append(np.asarray(seq.block_table)[p // bs] * bs + p % bs)
             cu.append(cu[-1] + len(seq))
-        meta = AttnMetadata(is_prefill=True, slot_mapping=self.to_device(np.concatenate(slots), np.int64), cu_seqlens=cu)
+            block_tables[i, : len(seq.block_table)] = seq.block_table
+        meta = AttnMetadata(
+            is_prefill=True, slot_mapping=self.to_device(np.concatenate(slots), np.int64), cu_seqlens=cu,
+            block_tables=self.to_device(block_tables, np.int32),
+            context_lens=self.to_device([len(seq) for seq in seqs], np.int32),
+        )
         input_ids = self.to_device(np.concatenate(ids), np.int64)
         last = self.to_device(cu[1:], np.int64) - 1  # logits only for each sequence's last token
         return input_ids, self.to_device(np.concatenate(pos), np.int64), meta, last
