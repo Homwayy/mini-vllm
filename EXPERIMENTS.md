@@ -2,7 +2,7 @@
 
 从零写一个小型 LLM 推理引擎（mini vLLM），在一张 12 GB 的笔记本 GPU 上服务 Qwen3-0.6B，逐项对比 KV cache 的管理方式、调度策略和注意力实现对吞吐和延迟的影响。
 
-目前完成了 E0（正确性）到 E6。在固定的离线负载 W1（256 条请求）上：
+目前完成了 E0（正确性）到 E7。在固定的离线负载 W1（256 条请求）上：
 
 - **E1（基线）：** 静态批处理的起点是 1760 输出 token/s，是 HF transformers 静态批处理（160 token/s）的 11.0 倍；但 KV 池里平均只有 26.2% 的槽位存着 token。
 - **E2（分页 KV）：** KV 改成分页以后，KV 利用率从 52% 提高到 99%，同一批能放的序列从 32 条提高到最多 60 条，吞吐提高 24.9%，到 2204 token/s。提升受限于静态批处理的尾部：每批都要等其中最长的请求。
@@ -27,6 +27,10 @@
 
 - 负载不超过处理能力时，连续批处理的首 token 延迟中位数约 40 ms，静态批处理要 3.5–6.5 秒。
 - 每秒 1–2 条的低负载下，同时运行的序列少，Triton 注意力让 TPOT 的中位数降低 19–26%。
+- **E7（分块 prefill）：** prompt 分几步算，和 decode 放在同一步里，每步最多 512 个 token。
+  - decode 不再等一整次 prefill：ITL 的 p99 降低 41–50%，最长的一次停顿从 91–138 ms 降到 25–29 ms。离线 W1 上（每步 1024 个 token），最长停顿从 0.54–0.58 秒降到 47 ms。
+  - 代价是首 token 晚一点，每秒 4 条时中位数从 36 ms 变成 44 ms；吞吐没有损失，超过处理能力时还高 3.7%。
+  - 每步的 token 数要补齐到 2 的幂才能录图。每步 2048 个 token 时补齐太多，每秒 8 条时 ITL 的 p99 反而比不分块差 20–23%。
 
 详见第 2 节。
 
@@ -36,7 +40,7 @@
   - E0：[tests/test_qwen3_hf.py](tests/test_qwen3_hf.py)、[tests/test_gpt2_nanogpt.py](tests/test_gpt2_nanogpt.py)。
   - W1 的吞吐：[bench/bench_offline.py](bench/bench_offline.py)；E1 里 HF 的那组用 [bench/bench_hf.py](bench/bench_hf.py)。
   - W2 的延迟：[bench/bench_online.py](bench/bench_online.py)。
-  - E4 的单层注意力和单步 decode：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)。
+  - E4 的单层注意力和单步 decode：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)；E7 的单步耗时：[bench/bench_mixed_step.py](bench/bench_mixed_step.py)。
 - 负载文件在 [bench/workloads/](bench/workloads/)，由 [bench/workloads.py](bench/workloads.py) 用固定的 seed 生成。
 - 第 3 节记录实现上的设计决策。其中的数字除了注明来自 results/ 的，都来自单独的检查脚本（没有放进仓库），只用来说明设计的原因；需要作为结论的数字，会在后面的实验里正式测量。
 
@@ -74,13 +78,14 @@
     - `admission=headroom`：和 optimistic 一样，但进入以后，池里还要给每条正在运行的序列各留一个空闲块。
   - `batching=static`：一批全部结束后才组下一批；`batching=continuous`：每一步都可以补进新请求，prefill 优先。
   - `prefix_caching=True`：前缀缓存，序列之间共享内容相同的整块 KV（见 E6、3.7）。只能和 `kv=paged`、`attention=triton` 一起用。
-- **其他固定设置：** 每一步要么全是 prefill，要么全是 decode；prefill 每步最多 16,384 个 token；最多同时运行 256 条序列；max_model_len 2048。
+  - `chunked_prefill=True`：分块 prefill，每步最多算 `max_num_batched_tokens` 个 token，prompt 可以分几步算完，和 decode 放在同一步里（见 E7、3.8）。只能和 `kv=paged`、`attention=triton`、`batching=continuous` 一起用。
+- **其他固定设置：** 不分块时，每一步要么全是 prefill，要么全是 decode，prefill 每步最多 16,384 个 token；最多同时运行 256 条序列；max_model_len 2048。
 - **注意力：** 三种实现，用 `attention` 切换：
   - `attention=flex`：FlexAttention。prefill 一次处理打平的多条序列（document mask），decode 按 block table 直接读 KV 池，见 3.1。E1–E3 用它。
   - `attention=triton`：prefill 和 decode 都用自己写的 Triton 分页注意力（见 3.5）。prefill 的 K/V 也全部从池里读，所以能接在已经缓存的前缀后面。
   - `attention=triton-decode`：decode 用 Triton，prefill 用 FlexAttention，是 E4 测的配置（E4 时它叫 `triton`）。
   - `attention=gather`：把每条序列的 KV 从池里拷出来、补齐，再调用 SDPA，只作为正确性和性能的参照。
-- **CUDA graph：** decode 按 batch 大小分桶（1、2、4、8，再从 16 到 256 每隔 16 一个，共 20 个）录图，batch 补齐到桶的大小，见 3.2。
+- **CUDA graph：** decode 按 batch 大小分桶（1、2、4、8，再从 16 到 256 每隔 16 一个，共 20 个）录图，batch 补齐到桶的大小，见 3.2。分块时，同时有 prompt 和 decode 的步按 token 数分桶，也录图（见 3.8）；不分块时 prefill 不录图。
 - **采样：** 每条请求可以有自己的 temperature、top-k 和 top-p。
 - **和最初计划的不同：** 计划里 FlexAttention 和 CUDA graph 分别是 E4、E5 的内容。但不录图时，decode 每一步的耗时几乎不随 batch 大小变化（见 3.4），会把批处理带来的收益放大。所以 E1–E3 都在开着这两项的引擎上测；E4、E5 改成在最终引擎上的消融实验：换掉注意力实现，或者关掉 CUDA graph。
 
@@ -100,6 +105,7 @@
 
 - **输出吞吐：** 输出 token 总数 ÷ 总耗时，总耗时从加入全部请求算到最后一条请求完成。总吞吐把 prompt token 也算进去。
 - **TTFT：** 请求到达到生成第一个 token 的时间。**TPOT：** 第一个 token 之后，平均每个 token 的间隔，每条请求算一个值。都取全部请求的 p50 和 p99。W1 的请求同时到达，TTFT 主要是排队的时间。
+- **ITL：** 同一条请求相邻两个输出 token 的间隔，所有请求的所有间隔放在一起，取 p50、p99 和最大值（E7 起记录）。TPOT 是每条请求的平均值，偶尔一次的长停顿会被平均掉；ITL 的 p99 和最大值看得出来。
 - **KV 指标：** 按 decode 步的耗时加权平均。
   - **KV 利用率：** 存着 token 的槽位 ÷ 已经分配给序列的槽位。
   - **池的分配比例：** 已经分配的槽位 ÷ 池的全部槽位。
@@ -130,6 +136,7 @@
 | E4b | 2026-10-07 | `c8b920b` | E4 的配置，`attention=triton`（prefill 也用 Triton） | 2704 token/s（对照组 2691、2690） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
 | E5 | 2026-10-07 | `b7c38b4` | E4b 的配置，`cuda_graph=False`（decode 不录图） | 1484 token/s（对照组 2656、2682） | 43.9 / 60 | 0.992 | 0.614 | 8.62 GiB |
 | E6 | 2026-10-07 | `995c15c` | E4b 的配置，`prefix_caching=True`；W1 上没有可共享的前缀，W3 见 E6 | 2708 token/s（对照组 2711、2712） | 46.7 / 60 | 0.992 | 0.652 | 8.63 GiB |
+| E7 | 2026-10-07 | `32ff87b` | E4b 的配置，`chunked_prefill=True`，每步最多 1024 个 token；W2 见 E7 | 2712 token/s（对照组 2711、2645） | 46.5 / 60 | 0.992 | 0.649 | 8.28 GiB |
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
@@ -651,6 +658,90 @@
 
 **结论：** 有共享前缀时，前缀缓存同时省下了计算（prefill 少算 87% 的 token）和显存（64 条请求共用一份前缀），离线总耗时缩短到 40%；在线负载越高收益越大，每秒 32 条时 TTFT 的 p99 从 1.46 秒降到 65 ms。没有共享前缀时没有可见的开销。剩下的问题是 prefill 仍然打断 decode：没有命中时，每来一条长 prompt，正在 decode 的序列都要等它算完，这是 E7（分块 prefill）要解决的。
 
+### E7：分块 prefill（W2、W1）
+
+- **改动：** 在 E4b 的引擎上（分页 KV，`admission=reserve`，连续批处理，`attention=triton`），只打开分块 prefill（`chunked_prefill=True`，[minivllm/scheduler.py](minivllm/scheduler.py) 里的 `schedule_chunked`，设计见 3.8）：
+  - 每一步最多算 `max_num_batched_tokens` 个 token，下面叫预算。正在 decode 的序列先排，每条 1 个 token；剩下的预算先给算到一半的 prompt，再给新进入的请求，最后一条可以只算一部分。
+  - 一步里只要有 prompt 的 token（通常还有 decode 行，下面叫混合步），就把 token 数补齐到 64、128、…、预算这几个桶，每个桶录一个 CUDA graph。E5 说明不录图时每步要多花 11–26 ms，所以混合步也要录图。
+  - 不分块时，prefill 单独一步，按实际的 token 数算，不录图；这一步里，正在 decode 的序列都在等。
+- **测了三层：** 在线 W2，预算 512、1024、2048；离线 W1，预算 1024；单步耗时（[bench/bench_mixed_step.py](bench/bench_mixed_step.py)），用来解释前两者。
+- **运行条件：** 2026-10-07，代码版本 `32ff87b`。在同一次测试里依次运行：
+  - 在线 W2：不分块、预算 512、1024、2048、不分块，每个配置按每秒 2、4、8 条各跑 1 次；
+  - 离线 W1：不分块、预算 1024、不分块，每组预热后跑 3 次。
+  - 单步耗时在这之后另跑一次，引擎的代码相同。
+
+**在线 W2**（不分块跑了前后两次，写成范围，只有一个数的是两次相同；每个预算跑一次）：
+
+| 每秒到达 | 指标 | 不分块 | 预算 512 | 预算 1024 | 预算 2048 |
+|---|---|---|---|---|---|
+| 2 条 | ITL p99 / 最大 | 32.5–32.8 / 111–112 ms | **19.1 / 25 ms** | 19.2 / 35 ms | 28.7 / 60 ms |
+| | TTFT p50 / p99 | 34–35 / 59–64 ms | 34 / 67 ms | 34 / 60 ms | 34 / 63 ms |
+| | TPOT p50 | 7.4 ms | 7.2 ms | 7.2 ms | 7.3 ms |
+| 4 条 | ITL p99 / 最大 | 47.7–49.7 / 115–138 ms | **24.8 / 26 ms** | 38.0 / 47 ms | 38.3 / 66 ms |
+| | TTFT p50 / p99 | 36 / 65–68 ms | 44 / 100 ms | 40 / 84 ms | 40 / 90 ms |
+| | TPOT p50 | 13.6–13.8 ms | **12.2 ms** | 12.6 ms | 12.8 ms |
+| 8 条 | ITL p99 / 最大 | 54.3–55.7 / 91–114 ms | **28.0 / 29 ms** | 41.3 / 43 ms | 66.9 / 71 ms |
+| | TTFT p50 / p99 | 6.05–6.12 / 17.1–17.2 s | **5.12 / 15.3 s** | 5.37 / 15.9 s | 5.63 / 16.4 s |
+| | TPOT p50 | 17.9–18.0 ms | 17.2 ms | 17.5 ms | 17.7 ms |
+| | 输出吞吐 | 2583–2584 token/s | **2678 token/s** | 2645 token/s | 2614 token/s |
+
+- **输出吞吐：** 每秒 2 条、4 条时由到达率决定，各配置分别是 1191 token/s 和 2192–2208 token/s，所以只列每秒 8 条的。
+- **ITL p50：** 就是一个普通 decode 步的耗时。每秒 2 条时各配置都是 6.8–6.9 ms，每秒 8 条时都是 15.8–15.9 ms；每秒 4 条时，分块的 11.2–11.6 ms 低于不分块的 12.3–12.4 ms，原因见下面的 TPOT。
+
+**单步耗时**（43 条正在 decode 的序列，各有 1000 个 token 的上下文，约是每秒 8 条时的平均 batch；再加一个 n 个 token 的 prompt。每个数是 20 次的中位数，包括采样）：
+
+| prompt 的 token 数 | 单独一步 prefill：不录图 / 录图 | 不分块：prefill 一步 + decode 一步 | 分块：一个混合步（补齐到） |
+|---|---|---|---|
+| 64 | 21.7 / 6.1 ms | 37.4 ms | **17.4 ms**（128） |
+| 256 | 25.2 / 11.3 ms | 40.8 ms | **28.0 ms**（512） |
+| 469 | 30.6 ms / — | 46.3 ms | **27.3 ms**（512） |
+| 512 | 28.1 / 20.2 ms | 43.8 ms | 46.9 ms（1024） |
+| 720 | 34.9 ms / — | 50.5 ms | **42.3 ms**（1024） |
+| 981 | 40.1 ms / — | 55.8 ms | **41.7 ms**（1024） |
+| 1024 | 40.4 / 38.3 ms | 56.1 ms | 73.6 ms（2048） |
+| 1100 | 41.1 ms / — | 56.8 ms | 73.3 ms（2048） |
+| 1500 | 55.8 ms / — | 71.5 ms | 71.6 ms（2048） |
+| 2005 | 72.4 ms / — | 88.1 ms | **77.0 ms**（2048） |
+
+- **录图的 prefill：** 用混合步的图只算这个 prompt，只在 prompt 正好是一个桶的大小、不用补齐时测。
+- **decode 一步：** 43 条单独一步是 15.7 ms。不分块时，decode 的序列在 prompt 进来的那次要等 prefill 一步加 decode 一步；分块时只等一个混合步。
+- **加粗：** 混合步比分开算快的。
+
+**离线 W1：**
+
+| | 不分块（前） | 预算 1024 | 不分块（后） |
+|---|---|---|---|
+| 输出吞吐（3 次的中位数） | 2711.3 token/s | 2712.1 token/s | 2644.7 token/s |
+| 3 次之间的差距 | 2.03% | 0.82% | 0.34% |
+| ITL p50 / p99 / 最大 | 15.8 / 52.6 / 543 ms | 16.1 / 42.2 / **47 ms** | 16.1 / 53.2 / 577 ms |
+| TTFT p50 | 17.9 s | 17.8 s | 18.4 s |
+| TPOT p50 / p99 | 17.9 / 18.9 ms | 17.8 / 19.1 ms | 18.4 / 19.6 ms |
+| 有 prompt 的步数（其中也有 decode 的） | 162（0） | 218（217） | 162（0） |
+| 显存峰值 | 8.63 GiB | 8.28 GiB | 8.63 GiB |
+| 录图：图的个数 / 耗时 / 多占的显存 | 20 / 1.9 s / 180 MiB | 25 / 2.4 s / 342 MiB | 20 / 1.9 s / 159 MiB |
+
+- **表中的数：** 输出吞吐是 3 次的中位数，其他的数取吞吐处在中位数的那一次。三组的 decode batch 平均都是 46.5–46.7，KV 利用率都是 0.992。
+
+结果：
+
+- **分块把 decode 的停顿限制在一步以内，预算越小，停顿越短。** 预算 512 时，三个到达率下 ITL 的 p99 降低 41–50%，最长的一次停顿从 91–138 ms 降到 25–29 ms。
+  - 不分块时，每来一条请求就单独做一次完整的 prefill，正在 decode 的序列先等它算完，再等自己的 decode 步。单步测试里，一个 720 个 token 的 prompt 让它们等 50.5 ms。每秒 8 条时，ITL 最长的 1% 全部是这种间隔（单独检查，见 3.8）。
+  - 分块以后，一步里的 prompt 最多算到预算为止，decode 行在同一步里拿到下一个 token。预算 512 时这样一步约 27 ms（单步测试里 43 条 decode 加 469 个 token 是 27.3 ms）。
+  - 离线 W1 上（预算 1024），最长的停顿从 543–577 ms 降到 47 ms，p99 从 52.6–53.2 ms 降到 42.2 ms。不分块时 prefill 每步最多 16,384 个 token，先拿到第一个 token 的序列，要等后面进入的请求的 prefill 算完。
+- **预算 2048 在每秒 8 条时，ITL 的 p99 反而比不分块差 20–23%（66.9 对 54.3–55.7 ms），原因是补齐：**
+  - 桶是 2 的幂，一步里的 token 刚过 1024 就要补到 2048。单步测试里，43 条 decode 加 1024 个 token 的 prompt，混合步要 73.6 ms；不分块时 prefill 一步加 decode 一步只要 56.1 ms。
+  - 每秒 8 条时请求在排队，前面结束一条才进入一两条，所以一步里常常是一两条完整的 prompt。单独检查：预算 2048 时，16% 的混合步补到了 2048 个 token，平均每步 70.8 ms，ITL 的 p99（那次是 68.6 ms）就在这附近；补出来的 token 占混合步全部 token 的 27%（见 3.8）。
+  - 预算 512 时补齐少得多（9.6%）：长 prompt 按预算切开，大多数混合步正好填满 512 个 token。
+- **代价是首 token 晚一点：** 每秒 4 条时，预算 512 的 TTFT 中位数从 36 ms 变成 44 ms，p99 从 65–68 ms 变成 100 ms。一个 prompt 要分几步算完，每一步还带着所有的 decode 行。每秒 2 条时同时运行的序列少，TTFT 的中位数不变。
+- **TPOT 和吞吐不降反升：**
+  - 每秒 4 条时，TPOT 的中位数降低 6–11%（13.6–13.8 → 12.2–12.8 ms）：decode 不再等整次 prefill，请求结束得更早，同时运行的序列也更少（decode batch 平均 28.3–28.5 → 25.8–27.0），每一步更快。
+  - 每秒 8 条超过了处理能力，这时输出吞吐提高 1.2–3.7%，预算越小越高；队列消化得更快，TTFT 的中位数从 6.05–6.12 秒降到 5.12–5.63 秒。
+  - 吞吐提高有两个来源。一是 decode 行搭在混合步里，几乎不另花时间：同一个桶、都不补齐时，混合步只比只算 prompt 多 3.4–7.1 ms（512 时 27.3 对 20.2 ms，1024 时 41.7 对 38.3 ms），而 43 条 decode 单独一步要 15.7 ms。二是不分块时 prefill 不录图，prompt 短时 CPU 提交 kernel 的时间比计算还长：64 个 token 时不录图 21.7 ms，录图 6.1 ms。第二个来源不是分块本身的功劳，不分块的引擎也可以给 prefill 录图。
+  - 离线 W1 上吞吐持平：2712.1 对 2711.3、2644.7 token/s。前后两组对照差了 2.5%，后一组变慢了，±2% 以内的差别判断不出来。
+- **显存：** 分块以后一步最多 1024 个 token（不分块时 prefill 最多 16,384 个），显存峰值从 8.63 GiB 降到 8.28 GiB；5 个混合步的图多占约 160–180 MiB，录图多花约 0.5 秒。
+
+**结论：** 分块 prefill 改善的主要是 decode 的停顿：预算 512 时 ITL 的 p99 降低 41–50%，最长的一次停顿从 0.1 秒左右降到 30 ms 以内，离线时从 0.5 秒以上降到 47 ms。代价是中等负载下首 token 晚几到几十毫秒；吞吐没有损失，过载时还高 1–4%。预算要小：一步的耗时由补齐以后的 token 数决定，预算 2048 时补齐太多，ITL 的 p99 比不分块还差。更细的桶（比如每 256 个 token 一个）能减少补齐，代价是多录几个图，还没有测。
+
 ## 3. 工程记录与设计决策
 
 ### 3.1 用 FlexAttention 做分页注意力
@@ -757,6 +848,35 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
   - batch 44 时，一层要读的不同的 K/V 从 217 MiB 降到 51 MiB；前缀块被几十个程序读，大多从 L2 读到。
   - batch 64 时，各存一份要 5056 个块，池里放不下。
 
+### 3.8 分块 prefill
+
+代码在 [minivllm/scheduler.py](minivllm/scheduler.py) 的 `schedule_chunked` 和 [minivllm/model_runner.py](minivllm/model_runner.py) 的 `run_chunked`：
+
+- **一步里的顺序：**
+  - 先排正在 decode 的序列，每条 1 个 token，保证它们每一步都前进；块不够时照常抢占最后进入的序列。
+  - 再排已经算了一部分的 prompt，最后才进入新请求，所以先进入的请求先拿到第一个 token。最后一条 prompt 只算预算剩下的部分。
+  - 预算不能小于 max_num_seqs，这样 decode 行总排得下。
+  - 每条序列记着已经算到第几个 token，只有算到最后一个已知 token 的那一步才取 logits、采样。被抢占的序列从头重算。
+- **混合步也录图：**
+  - token 数补齐到桶的大小：从 64 开始的 2 的幂，最后一个桶是预算本身。只有 decode 的步照常走 decode 的图。
+  - 序列放在固定数量的槽位里（max_num_seqs + 1 个）。补出来的 token 组成最后一条"假序列"，位置是 0、1、2、…，只读写池外面的那个块（同 3.2）；没用到的槽位没有 token。prefill kernel 的 grid 只取决于 token 总数和槽位数（见 3.5），也就只取决于桶的大小，所以可以录图。
+  - [tests/test_engine.py](tests/test_engine.py) 用 64 的预算把 prompt 切成多块，检查录图和不录图生成的 token 逐个相同；还用很小的池，让 prompt 算到一半时被抢占。
+- **混合步里，注意力全部用 prefill kernel，tile 取 32 行（16 个 token × 2 个 query 头）：** decode 的序列只有 1 个 token，一个 tile 里只有 2 行有用。按 tile 的行数算，每读 1 字节 K/V 约要做 32 次浮点运算，低于这张卡的算力和带宽之比（61.4 TFLOPS ÷ 617 GB/s ≈ 100），所以 decode 行仍然受读 K/V 的带宽限制；tile 是 128 行时约 128 次，会变成受计算限制（估算）。
+- **和前缀缓存一起用：** 块在算它的那一步被调度时登记（3.7）。分块时，prompt 的每一块被调度时，登记其中写满的整块。
+- **每秒 8 条时每一步的情况**（单独检查：W2 每秒 8 条，每个配置跑一次，记录每一步；ITL 的 p99 和正式测试相差不到 2 ms）：
+
+| | 不分块 | 预算 512 | 预算 1024 | 预算 2048 |
+|---|---|---|---|---|
+| 有 prompt 的步：步数 / 平均耗时 | 210 / 33.3 ms | 414 / 25.0 ms | 250 / 34.1 ms | 211 / 41.0 ms |
+| 平均每步的 prompt token 数 | 705 | 357 | 592 | 701 |
+| 补到最大的桶的步：占比 / 平均耗时 | — | 78% / 26.6 ms | 65% / 40.2 ms | 16% / 70.8 ms |
+| 补出来的 token 占这些步的比例 | 0 | 9.6% | 20.5% | 27.1% |
+| ITL p99 | 55.5 ms | 29.3 ms | 42.0 ms | 68.6 ms |
+| ITL 最长的 1% 落在 | 含一次单独 prefill 的间隔（全部） | 混合步（93%） | 混合步（全部） | 混合步（全部） |
+
+  - **有 prompt 的步：** 不分块时只算 prompt；分块时还带着 decode 行。
+  - 预算 512 时，最长的 1% 里另外 7% 是几个偶尔变慢的 decode 步。
+
 ## 4. 实验列表
 
 | 编号 | 改动 | 对照 | 负载 | 状态 |
@@ -771,5 +891,5 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 | E4b | prefill 也换成自己写的 Triton 分页 kernel（`attention=triton`） | `attention=triton-decode` | 单层 prefill；W1 | 已完成：单层 prefill 是 flex 的 1.9–2.5 倍；W1 吞吐提高 0.49%，见第 2 节 |
 | E5 | CUDA graph 的消融：关掉 decode 的录图 | 录图 | 单步 decode；W1 | 已完成：不录图时 W1 吞吐低 44%（1484 对 2669 token/s），batch 1 每步慢 6.2 倍；录 20 个图要 1.9 秒、212 MiB，见第 2 节 |
 | E6 | 前缀缓存（`prefix_caching=True`） | 不开 | W3 离线和在线；W1 | 已完成：W3 离线总耗时 5.8 → 2.3 秒（命中率 0.869）；在线每秒 32 条时 TTFT 的 p99 从 1.46 秒降到 65 ms；W1 上没有可见的开销，见第 2 节 |
-| E7 | 分块 prefill | 不分块 | W2 | 待做 |
+| E7 | 分块 prefill（`chunked_prefill=True`），每步最多 512、1024、2048 个 token | 不分块 | W2；W1；单步耗时 | 已完成：每步 512 个 token 时，W2 上 ITL 的 p99 降低 41–50%，最长停顿从 91–138 ms 降到 25–29 ms，过载时吞吐高 3.7%；每秒 4 条时 TTFT 中位数 36 → 44 ms；W1 吞吐持平；每步 2048 个 token 时补齐太多，ITL 的 p99 反而变差，见第 2 节 |
 | E8 | 投机解码（GPT-2）：n-gram、MTP-1、DSpark 式起草，置信度调度 | 不用投机解码 | W4 | 待做 |

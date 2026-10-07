@@ -1,0 +1,99 @@
+{
+ "budget": 2048,
+ "batch": 43,
+ "context": 1000,
+ "iters": 20,
+ "decode_ms": 15.683649999118643,
+ "gpu": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+ "torch": "2.11.0+cu128",
+ "rows": [
+  {
+   "prompt": 64,
+   "eager_prefill_ms": 21.714649999921676,
+   "separate_ms": 37.39829999904032,
+   "graph_prefill_ms": 6.117150001955451,
+   "bucket": 128,
+   "mixed_ms": 17.396449999068864
+  },
+  {
+   "prompt": 128,
+   "eager_prefill_ms": 28.26074999757111,
+   "separate_ms": 43.944399996689754,
+   "graph_prefill_ms": 7.900099997641519,
+   "bucket": 256,
+   "mixed_ms": 20.140900000114925
+  },
+  {
+   "prompt": 256,
+   "eager_prefill_ms": 25.15155000219238,
+   "separate_ms": 40.83520000131102,
+   "graph_prefill_ms": 11.300400001346134,
+   "bucket": 512,
+   "mixed_ms": 28.03845000016736
+  },
+  {
+   "prompt": 469,
+   "eager_prefill_ms": 30.638050000561634,
+   "separate_ms": 46.32169999968028,
+   "bucket": 512,
+   "mixed_ms": 27.278100002149586
+  },
+  {
+   "prompt": 512,
+   "eager_prefill_ms": 28.085999998438638,
+   "separate_ms": 43.76964999755728,
+   "graph_prefill_ms": 20.1629499970295,
+   "bucket": 1024,
+   "mixed_ms": 46.860750000632834
+  },
+  {
+   "prompt": 720,
+   "eager_prefill_ms": 34.846499998820946,
+   "separate_ms": 50.53014999793959,
+   "bucket": 1024,
+   "mixed_ms": 42.34175000237883
+  },
+  {
+   "prompt": 981,
+   "eager_prefill_ms": 40.071150000585476,
+   "separate_ms": 55.75479999970412,
+   "bucket": 1024,
+   "mixed_ms": 41.719049997482216
+  },
+  {
+   "prompt": 1024,
+   "eager_prefill_ms": 40.361649997066706,
+   "separate_ms": 56.04529999618535,
+   "graph_prefill_ms": 38.288150000880705,
+   "bucket": 2048,
+   "mixed_ms": 73.61405000119703
+  },
+  {
+   "prompt": 1100,
+   "eager_prefill_ms": 41.0936500011303,
+   "separate_ms": 56.77730000024894,
+   "bucket": 2048,
+   "mixed_ms": 73.29919999756385
+  },
+  {
+   "prompt": 1500,
+   "eager_prefill_ms": 55.77410000114469,
+   "separate_ms": 71.45775000026333,
+   "bucket": 2048,
+   "mixed_ms": 71.63964999926975
+  },
+  {
+   "prompt": 2005,
+   "eager_prefill_ms": 72.37535000240314,
+   "separate_ms": 88.05900000152178,
+   "bucket": 2048,
+   "mixed_ms": 77.01730000189855
+  },
+  {
+   "prompt": 2048,
+   "eager_prefill_ms": 76.72880000245641,
+   "separate_ms": 92.41245000157505,
+   "graph_prefill_ms": 72.32560000193189
+  }
+ ]
+}
