@@ -142,7 +142,9 @@ def _attend_block(
     return acc, m_new, l_i
 
 
-@triton.jit
+# the number of sequences and the block table's width change every step; not specializing on them keeps
+# a single compiled kernel
+@triton.jit(do_not_specialize=["num_seqs", "stride_btb"])
 def _prefill_kernel(
     Q, K, V, Out, block_tables, cu_seqlens, seq_lens, qk_scale, num_seqs,
     stride_qt, stride_qh,
