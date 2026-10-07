@@ -1,0 +1,44 @@
+{
+ "attention": "triton",
+ "prompt_len": 1024,
+ "steps": 50,
+ "gpu": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+ "torch": "2.11.0+cu128",
+ "rows": [
+  {
+   "batch": 1,
+   "step_ms": 4.992488000061712,
+   "tokens_per_s": 200.30093211794178
+  },
+  {
+   "batch": 2,
+   "step_ms": 5.5964339999627555,
+   "tokens_per_s": 357.37042552691764
+  },
+  {
+   "batch": 4,
+   "step_ms": 5.909630000023753,
+   "tokens_per_s": 676.8613263408914
+  },
+  {
+   "batch": 8,
+   "step_ms": 6.957055999955628,
+   "tokens_per_s": 1149.9116867897892
+  },
+  {
+   "batch": 16,
+   "step_ms": 8.890605999986292,
+   "tokens_per_s": 1799.652352159647
+  },
+  {
+   "batch": 32,
+   "step_ms": 12.091217999986839,
+   "tokens_per_s": 2646.54892501606
+  },
+  {
+   "batch": 48,
+   "step_ms": 16.837566000031075,
+   "tokens_per_s": 2850.768335513067
+  }
+ ]
+}
