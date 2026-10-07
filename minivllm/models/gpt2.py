@@ -54,7 +54,8 @@ class GPT2Attention(nn.Module):
         T = x.shape[0]
         q, k, v = self.c_attn(x).view(T, 3, self.num_heads, self.head_dim).unbind(1)
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        store_kv(k, v, self.k_cache, self.v_cache, meta.slot_mapping)
+        if self.k_cache is not None:  # training (the draft model) attends without a cache
+            store_kv(k, v, self.k_cache, self.v_cache, meta.slot_mapping)
         o = self.attn(q, k, v, self.k_cache, self.v_cache, meta)
         return self.c_proj(o.reshape(T, -1))
 
