@@ -16,6 +16,7 @@ from torch.nn.attention import SDPBackend, sdpa_kernel
 from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
+from minivllm.attention.triton_paged import TritonAttention
 from minivllm.model_runner import decode_buckets
 
 BLOCK_SIZE = 16
@@ -117,6 +118,7 @@ def main():
         backends = {
             "gather": GatherAttention(),
             "flex": FlexAttention(BLOCK_SIZE, MAX_TOKENS, MAX_SEQS, device),
+            "triton": TritonAttention(BLOCK_SIZE, MAX_TOKENS, MAX_SEQS, device),
         }
         g0 = graph_count()
         prefill = check_prefill(backends, Hq, Hkv, D, rng, 30, device)

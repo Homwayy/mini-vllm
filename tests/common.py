@@ -9,6 +9,7 @@ import torch
 from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
+from minivllm.attention.triton_paged import TritonAttention
 
 VAL_BIN = r"A:\GitHub project\nanoGPT\data\fineweb_edu\val.bin"
 EOT = 50256  # GPT-2 <|endoftext|>, placed before every document in val.bin
@@ -24,10 +25,12 @@ def val_documents(n_tokens=2_000_000):
 
 def attention_from_args(block_size, max_tokens, max_seqs, device):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--attn", choices=["gather", "flex"], default="gather")
+    parser.add_argument("--attn", choices=["gather", "flex", "triton"], default="gather")
     name = parser.parse_args().attn
     if name == "gather":
         return name, GatherAttention()
+    if name == "triton":
+        return name, TritonAttention(block_size, max_tokens, max_seqs, device)
     return name, FlexAttention(block_size, max_tokens, max_seqs, device)
 
 

@@ -1,0 +1,185 @@
+{
+  "model": "nanoGPT GPT-2 124M",
+  "attention": "triton",
+  "block_size": 16,
+  "new_tokens": 128,
+  "prompts": [
+    {
+      "prompt_len": 17,
+      "prefill_ours_vs_nano_bf16": {
+        "max_abs_err": 0.0625,
+        "mean_abs_err": 0.006032945122569799,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.05750274658203125,
+        "mean_abs_err": 0.008118228055536747,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "prefill_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.06361865997314453,
+        "mean_abs_err": 0.00817303266376257,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "prefill_bitwise_equal_to_nano_bf16": false,
+      "decode_ours_vs_nano_bf16": {
+        "max_abs_err": 0.125,
+        "mean_abs_err": 0.005949484650045633,
+        "argmax_agree": 0.9921875,
+        "max_fp32_regret": 0.0625
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.06508064270019531,
+        "mean_abs_err": 0.009141477756202221,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.026938438415527344
+      },
+      "decode_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.06727123260498047,
+        "mean_abs_err": 0.009080623276531696,
+        "argmax_agree": 0.9921875,
+        "max_fp32_regret": 0.026938438415527344
+      },
+      "greedy_first_divergence": 8,
+      "nano_top2_margin_at_divergence": 0.0,
+      "generated_padding_ids": 0,
+      "alone_prefill_bitwise_equal": false,
+      "alone_greedy_identical": false
+    },
+    {
+      "prompt_len": 120,
+      "prefill_ours_vs_nano_bf16": {
+        "max_abs_err": 0.0625,
+        "mean_abs_err": 0.004579870030283928,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.0678110122680664,
+        "mean_abs_err": 0.008726341649889946,
+        "argmax_agree": 0.9916667342185974,
+        "max_fp32_regret": 0.028273582458496094
+      },
+      "prefill_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.0678110122680664,
+        "mean_abs_err": 0.008677349425852299,
+        "argmax_agree": 0.9916667342185974,
+        "max_fp32_regret": 0.028273582458496094
+      },
+      "prefill_bitwise_equal_to_nano_bf16": false,
+      "decode_ours_vs_nano_bf16": {
+        "max_abs_err": 0.125,
+        "mean_abs_err": 0.007129095960408449,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.08574962615966797,
+        "mean_abs_err": 0.009451366029679775,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.0730123519897461,
+        "mean_abs_err": 0.009090960025787354,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "greedy_first_divergence": null,
+      "generated_padding_ids": 0,
+      "alone_prefill_bitwise_equal": false,
+      "alone_greedy_identical": true
+    },
+    {
+      "prompt_len": 517,
+      "prefill_ours_vs_nano_bf16": {
+        "max_abs_err": 0.0625,
+        "mean_abs_err": 0.005170333664864302,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.07791519165039062,
+        "mean_abs_err": 0.008625930175185204,
+        "argmax_agree": 0.9845261573791504,
+        "max_fp32_regret": 0.049757957458496094
+      },
+      "prefill_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.07026481628417969,
+        "mean_abs_err": 0.008522211574018002,
+        "argmax_agree": 0.9845261573791504,
+        "max_fp32_regret": 0.049757957458496094
+      },
+      "prefill_bitwise_equal_to_nano_bf16": false,
+      "decode_ours_vs_nano_bf16": {
+        "max_abs_err": 0.0625,
+        "mean_abs_err": 0.006306259892880917,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.08470392227172852,
+        "mean_abs_err": 0.009459823369979858,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.06801223754882812,
+        "mean_abs_err": 0.008991261012852192,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "greedy_first_divergence": null,
+      "generated_padding_ids": 0,
+      "alone_prefill_bitwise_equal": false,
+      "alone_greedy_identical": true
+    },
+    {
+      "prompt_len": 896,
+      "prefill_ours_vs_nano_bf16": {
+        "max_abs_err": 0.125,
+        "mean_abs_err": 0.005439911503344774,
+        "argmax_agree": 0.996651828289032,
+        "max_fp32_regret": 0.0625
+      },
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.07982826232910156,
+        "mean_abs_err": 0.008655376732349396,
+        "argmax_agree": 0.981026828289032,
+        "max_fp32_regret": 0.036655426025390625
+      },
+      "prefill_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.08061790466308594,
+        "mean_abs_err": 0.008669990114867687,
+        "argmax_agree": 0.9821429252624512,
+        "max_fp32_regret": 0.036655426025390625
+      },
+      "prefill_bitwise_equal_to_nano_bf16": false,
+      "decode_ours_vs_nano_bf16": {
+        "max_abs_err": 0.125,
+        "mean_abs_err": 0.006507210899144411,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.06434249877929688,
+        "mean_abs_err": 0.00896895956248045,
+        "argmax_agree": 0.9921875,
+        "max_fp32_regret": 0.026711463928222656
+      },
+      "decode_nano_bf16_vs_fp32": {
+        "max_abs_err": 0.06379508972167969,
+        "mean_abs_err": 0.008583258837461472,
+        "argmax_agree": 0.9921875,
+        "max_fp32_regret": 0.026711463928222656
+      },
+      "greedy_first_divergence": null,
+      "generated_padding_ids": 0,
+      "alone_prefill_bitwise_equal": false,
+      "alone_greedy_identical": true
+    }
+  ]
+}

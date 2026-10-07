@@ -15,6 +15,7 @@ import torch
 from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
+from minivllm.attention.triton_paged import TritonAttention
 from minivllm.kv_manager import cdiv
 from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
@@ -39,6 +40,8 @@ class ModelRunner:
         info = MODELS[cfg.model]
         if cfg.attention == "flex":
             attn = FlexAttention(cfg.block_size, cfg.max_num_batched_tokens, cfg.max_num_seqs, device)
+        elif cfg.attention == "triton":
+            attn = TritonAttention(cfg.block_size, cfg.max_num_batched_tokens, cfg.max_num_seqs, device)
         elif cfg.attention == "gather":
             attn = GatherAttention()
         else:

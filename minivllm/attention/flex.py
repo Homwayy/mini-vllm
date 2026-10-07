@@ -24,7 +24,7 @@ SPARSE_BLOCK = 128  # block size of the prefill mask, and the query block size f
 class FlexAttention:
     def __init__(self, block_size, max_num_batched_tokens, max_num_seqs, device):
         self.block_size = block_size
-        self.decode_masks = {}  # batch size -> (BlockMask, its index tensors)
+        self.decode_masks = {}  # (batch size, block table width) -> (BlockMask, its index tensors)
         padded = -(-max_num_batched_tokens // SPARSE_BLOCK) * SPARSE_BLOCK
         self.doc = torch.full((padded,), -1, dtype=torch.int32, device=device)  # sequence of each packed token
         self.last_len = torch.zeros(max_num_seqs, dtype=torch.int32, device=device)  # tokens in each last page
@@ -94,7 +94,7 @@ class FlexAttention:
         # every row must have at least one token of context
         P = self.block_size
         B, width = block_tables.shape
-        if B not in self.decode_masks:
+        if (B, width) not in self.decode_masks:
             dev = block_tables.device
             kv_num = torch.ones(B, 1, 1, dtype=torch.int32, device=dev)  # the last page is the one partial block
             kv_idx = torch.zeros(B, 1, 1, width, dtype=torch.int32, device=dev)
@@ -104,8 +104,8 @@ class FlexAttention:
                 kv_num, kv_idx, full_num, full_idx, BLOCK_SIZE=(SPARSE_BLOCK, P),
                 mask_mod=self.decode_mask, seq_lengths=(1, num_blocks * P), compute_q_blocks=False,
             )
-            self.decode_masks[B] = (block_mask, kv_idx, full_num, full_idx)
-        block_mask, kv_idx, full_num, full_idx = self.decode_masks[B]
+            self.decode_masks[B, width] = (block_mask, kv_idx, full_num, full_idx)
+        block_mask, kv_idx, full_num, full_idx = self.decode_masks[B, width]
         npages = (context_lens + P - 1) // P
         self.last_len[:B] = context_lens - (npages - 1) * P
         full_num.view(B).copy_(npages - 1)

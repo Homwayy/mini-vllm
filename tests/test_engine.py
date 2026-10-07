@@ -111,10 +111,14 @@ def main():
     del engine
     torch.cuda.empty_cache()
 
-    engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "attention": "gather"}))
-    ok &= run_case(engine, prompts, params, "qwen3 gather {'kv': 'paged', 'batching': 'continuous'}")
-    del engine
-    torch.cuda.empty_cache()
+    for attention in ("gather", "triton"):
+        engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "attention": attention}))
+        ok &= run_case(engine, prompts, params, f"qwen3 {attention} {{'kv': 'paged', 'batching': 'continuous'}}")
+        engine.cfg = EngineConfig(**{**engine.cfg.__dict__, **CASES[4]})
+        engine.reset()
+        ok &= run_case(engine, prompts, params, f"qwen3 {attention} {CASES[4]}")
+        del engine
+        torch.cuda.empty_cache()
 
     gcfg = EngineConfig(model="gpt2", num_kv_blocks=1024, max_num_seqs=16, max_num_batched_tokens=4096, max_model_len=512)
     engine = LLMEngine(gcfg)
@@ -123,6 +127,10 @@ def main():
         engine.cfg = EngineConfig(**{**gcfg.__dict__, **case})
         engine.reset()
         ok &= run_case(engine, prompts, params, f"gpt2 flex {case}")
+    del engine
+    torch.cuda.empty_cache()
+    engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "triton"}))
+    ok &= run_case(engine, prompts, params, "gpt2 triton {'kv': 'paged', 'batching': 'continuous'}")
     print("PASS" if ok else "FAIL")
 
 
