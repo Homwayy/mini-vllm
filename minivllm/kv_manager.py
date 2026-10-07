@@ -2,7 +2,8 @@
 attention backends do not change between them.
 
 Before a sequence runs a step, its blocks must cover all of its tokens: a prefill writes K/V for every
-token, and a decode step writes K/V for the newest one.
+token, and a decode step writes K/V for the newest one. With speculative decoding, a step also writes K/V
+for `extra` draft tokens after them.
 """
 
 from collections import OrderedDict, deque
@@ -37,10 +38,13 @@ class ContiguousKV:
         r = self.free_regions.popleft()
         seq.block_table = list(range(r * self.blocks_per_seq, (r + 1) * self.blocks_per_seq))
 
-    def can_append(self, seq: Sequence):
+    def can_append(self, seq: Sequence, extra=0):
         return True
 
-    def append(self, seq: Sequence):
+    def append(self, seq: Sequence, extra=0):
+        pass
+
+    def truncate(self, seq: Sequence):
         pass
 
     def release(self, seq: Sequence):
@@ -90,12 +94,17 @@ class PagedKV:
             self.reserved += cdiv(seq.max_len, self.block_size)
         self.append(seq)
 
-    def can_append(self, seq: Sequence):
-        return cdiv(len(seq), self.block_size) - len(seq.block_table) <= len(self.free_blocks)
+    def can_append(self, seq: Sequence, extra=0):
+        return cdiv(len(seq) + extra, self.block_size) - len(seq.block_table) <= len(self.free_blocks)
 
-    def append(self, seq: Sequence):
-        for _ in range(cdiv(len(seq), self.block_size) - len(seq.block_table)):
+    def append(self, seq: Sequence, extra=0):
+        for _ in range(cdiv(len(seq) + extra, self.block_size) - len(seq.block_table)):
             seq.block_table.append(self.free_blocks.popleft())
+
+    def truncate(self, seq: Sequence):
+        """Frees the blocks past seq's tokens, which only held rejected draft tokens."""
+        while len(seq.block_table) > cdiv(len(seq), self.block_size):
+            self.free_blocks.append(seq.block_table.pop())
 
     def release(self, seq: Sequence):
         if self.admission == "reserve":

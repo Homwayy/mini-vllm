@@ -9,23 +9,29 @@ With chunked prefill, a step that computes more than one token of some sequence 
 a token-count bucket instead. Its sequences sit in a fixed number of slots: the padding tokens form one
 more sequence that reads and writes only the scratch block, and unused slots have no tokens. The prefill
 kernel then runs with a grid that depends only on the bucket, so mixed steps are captured as well.
+
+With speculative decoding, a decode step that checks draft tokens (a verify step) is a mixed step too: each
+sequence computes its last token and its drafts, so a sequence without drafts adds a single row.
 """
 
+import itertools
 import os
 import time
 
 import numpy as np
 import torch
+import triton
 
 from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
-from minivllm.attention.triton_paged import TritonAttention
+from minivllm.attention.triton_paged import TritonAttention, prefill_block_m
 from minivllm.kv_manager import cdiv
 from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
 from minivllm.sampler import Sampler
 from minivllm.sequence import Sequence
+from minivllm.spec.rejection import verify_drafts
 
 MODELS = {
     "qwen3": dict(path=os.path.join("checkpoints", "Qwen3-0.6B"), eos=(151643, 151645), vocab_limit=None),
@@ -42,12 +48,12 @@ def decode_buckets(max_num_seqs):
     return sizes + [max_num_seqs]
 
 
-def mixed_buckets(max_num_batched_tokens):
-    sizes, b = [], 64
-    while b < max_num_batched_tokens:
+def mixed_buckets(max_tokens, smallest=64):
+    sizes, b = [], smallest
+    while b < max_tokens:
         sizes.append(b)
         b *= 2
-    return sizes + [max_num_batched_tokens]
+    return sizes + [max_tokens]
 
 
 class ModelRunner:
@@ -90,14 +96,23 @@ class ModelRunner:
         self.dec_block_tables = torch.zeros(n, w, dtype=torch.int32, device=device)
         self.dec_context_lens = torch.zeros(n, dtype=torch.int32, device=device)
         self.graphs = {}  # bucket -> (CUDAGraph, hidden-state output)
-        self.mixed_buckets = mixed_buckets(cfg.max_num_batched_tokens) if cfg.chunked_prefill else []
+        # mixed steps: prompt chunks with decode rows, or (speculative decoding) decode rows with their drafts
+        self.mixed_buckets, self.mixed_block_m = [], MIXED_BLOCK_M
         if cfg.chunked_prefill:
-            t, n = cfg.max_num_batched_tokens, cfg.max_num_seqs + 1  # one more slot for the padding tokens
+            self.mixed_buckets = mixed_buckets(cfg.max_num_batched_tokens)
+        elif cfg.spec:
+            self.mixed_buckets = mixed_buckets(cfg.max_num_seqs * (cfg.num_spec_tokens + 1), smallest=8)
+            group = self.model.attn_layers[0].num_heads // self.model.num_kv_heads
+            self.mixed_block_m = prefill_block_m(cfg.num_spec_tokens + 1, triton.next_power_of_2(group))
+        if self.mixed_buckets:
+            t, n = self.mixed_buckets[-1], cfg.max_num_seqs + 1  # one more slot for the padding tokens
             self.mix_ids = torch.zeros(t, dtype=torch.int64, device=device)
             self.mix_pos = torch.zeros(t, dtype=torch.int64, device=device)
             self.mix_slots = torch.zeros(t, dtype=torch.int64, device=device)
             self.mix_cu = torch.zeros(n + 1, dtype=torch.int32, device=device)
             self.mix_seq_lens = torch.ones(n, dtype=torch.int32, device=device)
+            # wide enough for the padding sequence, which can be longer than any real one
+            w = max(w, cdiv(t, cfg.block_size))
             self.mix_block_tables = torch.zeros(n, w, dtype=torch.int32, device=device)
         self.mixed_graphs = {}  # token bucket -> (CUDAGraph, hidden-state output)
         self.use_cuda_graph = False
@@ -156,46 +171,41 @@ class ModelRunner:
         )
         return self.model(self.dec_ids[:padded], self.dec_pos[:padded], meta)
 
-    def fill_mixed_buffers(self, plan, padded: int):
-        """Writes a mixed step into the static buffers; returns the token rows whose logits are needed.
+    def fill_mixed_buffers(self, entries, padded: int):
+        """Writes a mixed step into the static buffers; returns the first row of each entry, then the end.
 
-        plan is [(sequence, n)]: each sequence computes its next n tokens, from num_computed_tokens on.
+        entries is [(sequence, tokens)]: each sequence computes `tokens`, at the positions from its
+        num_computed_tokens on.
         """
-        bs, num_slots = self.cfg.block_size, self.mix_seq_lens.shape[0]
-        ids = np.zeros(padded, np.int64)
-        pos = np.zeros(padded, np.int64)
-        slots = np.zeros(padded, np.int64)
-        cu = np.zeros(num_slots + 1, np.int32)
-        seq_lens = np.ones(num_slots, np.int32)
-        block_tables = np.full((num_slots, self.max_blocks_per_seq), self.scratch_block, np.int32)
-        rows, t = [], 0
-        for i, (seq, n) in enumerate(plan):
-            c = seq.num_computed_tokens
-            p = np.arange(c, c + n)
-            ids[t : t + n] = seq.token_ids[c : c + n]
-            pos[t : t + n] = p
-            slots[t : t + n] = np.asarray(seq.block_table)[p // bs] * bs + p % bs
+        bs, num_slots, k = self.cfg.block_size, self.mix_seq_lens.shape[0], len(entries)
+        n = np.array([len(tokens) for _, tokens in entries], np.int64)
+        start = np.array([seq.num_computed_tokens for seq, _ in entries], np.int64)
+        cu = np.full(num_slots + 1, padded, np.int32)  # unused slots have no tokens
+        cu[0] = 0
+        cu[1 : k + 1] = np.cumsum(n)
+        t = int(cu[k])
+        block_tables = np.full(self.mix_block_tables.shape, self.scratch_block, np.int32)
+        for i, (seq, _) in enumerate(entries):
             block_tables[i, : len(seq.block_table)] = seq.block_table
-            seq_lens[i] = c + n
-            t += n
-            cu[i + 1] = t
-            if c + n == len(seq):  # its last known token: the next one is sampled from it
-                rows.append(t - 1)
+        seq_lens = np.ones(num_slots, np.int32)
+        seq_lens[:k] = start + n
         # the padding tokens: one more sequence, at positions 0, 1, ..., that only touches the scratch block
-        pos[t:] = np.arange(padded - t)
-        slots[t:] = self.scratch_block * bs + pos[t:] % bs
-        seq_lens[len(plan)] = max(padded - t, 1)
-        cu[len(plan) + 1 :] = padded
+        seq_lens[k] = max(padded - t, 1)
+        pos = np.concatenate([np.arange(t) - np.repeat(cu[:k], n) + np.repeat(start, n), np.arange(padded - t)])
+        owner = np.repeat(np.arange(k + 1), np.append(n, padded - t))
+        slots = block_tables[owner, pos // bs].astype(np.int64) * bs + pos % bs
+        ids = np.zeros(padded, np.int64)
+        ids[:t] = list(itertools.chain.from_iterable(tokens for _, tokens in entries))
         for buf, x in ((self.mix_ids, ids), (self.mix_pos, pos), (self.mix_slots, slots)):
             buf[:padded].copy_(torch.from_numpy(x))
         for buf, x in ((self.mix_cu, cu), (self.mix_seq_lens, seq_lens), (self.mix_block_tables, block_tables)):
             buf.copy_(torch.from_numpy(x))
-        return rows
+        return cu[: k + 1]
 
     def mixed_hidden(self, padded: int):
         meta = AttnMetadata(
             is_prefill=True, slot_mapping=self.mix_slots[:padded], block_tables=self.mix_block_tables,
-            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, MIXED_BLOCK_M),
+            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, self.mixed_block_m),
         )
         return self.model(self.mix_ids[:padded], self.mix_pos[:padded], meta)
 
@@ -260,16 +270,33 @@ class ModelRunner:
         if all(n == 1 for _, n in plan):  # only last tokens to compute: an ordinary decode step
             return self.run([seq for seq, _ in plan], is_prefill=False)
         padded = next(b for b in self.mixed_buckets if b >= sum(n for _, n in plan))
-        rows = self.fill_mixed_buffers(plan, padded)
-        if self.use_cuda_graph:
-            graph, hidden = self.mixed_graphs[padded]
-            graph.replay()
-        else:
-            hidden = self.mixed_hidden(padded)
+        entries = [(seq, seq.token_ids[seq.num_computed_tokens : seq.num_computed_tokens + n]) for seq, n in plan]
+        cu = self.fill_mixed_buffers(entries, padded)
+        hidden = self.mixed_forward(padded)
         out = [None] * len(plan)
-        if rows:
-            sampled = [i for i, (seq, n) in enumerate(plan) if seq.num_computed_tokens + n == len(seq)]
-            logits = self.model.compute_logits(hidden[self.to_device(rows, np.int64)])
+        # a sequence whose step reaches its last known token samples the next one from it
+        sampled = [i for i, (seq, n) in enumerate(plan) if seq.num_computed_tokens + n == len(seq)]
+        if sampled:
+            logits = self.model.compute_logits(hidden[self.to_device([cu[i + 1] - 1 for i in sampled], np.int64)])
             for i, tok in zip(sampled, self.sampler(logits, [plan[i][0].params for i in sampled]).tolist()):
                 out[i] = tok
         return out
+
+    @torch.inference_mode()
+    def run_verify(self, seqs: list[Sequence], drafts: list[list[int]]) -> list[list[int]]:
+        """A decode step that also checks each sequence's draft tokens; returns per sequence the accepted
+        drafts followed by one token from the target model."""
+        if not any(drafts):
+            return [[tok] for tok in self.run(seqs, is_prefill=False)]
+        t = len(seqs) + sum(map(len, drafts))
+        padded = next(b for b in self.mixed_buckets if b >= t)
+        self.fill_mixed_buffers([(seq, [seq.token_ids[-1]] + d) for seq, d in zip(seqs, drafts)], padded)
+        logits = self.model.compute_logits(self.mixed_forward(padded)[:t])
+        return verify_drafts(self.sampler, logits, [seq.params for seq in seqs], drafts)
+
+    def mixed_forward(self, padded: int):
+        if self.use_cuda_graph:
+            graph, hidden = self.mixed_graphs[padded]
+            graph.replay()
+            return hidden
+        return self.mixed_hidden(padded)

@@ -7,6 +7,7 @@ from minivllm.kv_manager import ContiguousKV, PagedKV, PrefixCachingKV, cdiv
 from minivllm.model_runner import ModelRunner
 from minivllm.scheduler import Scheduler
 from minivllm.sequence import SamplingParams, Sequence
+from minivllm.spec.ngram import NgramProposer
 from minivllm.utils import cap_gpu_memory
 
 
@@ -23,6 +24,10 @@ class EngineConfig:
     # mix prompt chunks with decoding in steps of at most max_num_batched_tokens (paged, triton, continuous)
     chunked_prefill: bool = False
     cuda_graph: bool = True  # capture the decode step per batch-size bucket
+    # speculative decoding: "ngram" drafts up to num_spec_tokens tokens per sequence and decode step, and the
+    # target model checks them all in that step (attention="triton", without prefix caching or chunked prefill)
+    spec: str | None = None
+    num_spec_tokens: int = 4
     block_size: int = 16
     num_kv_blocks: int = 4096
     max_num_seqs: int = 256
@@ -42,6 +47,8 @@ class StepRecord:
     kv_used_tokens: int
     kv_allocated_slots: int
     num_decode: int  # sequences that computed one token and got their next token from it
+    num_draft: int = 0  # speculative decoding: draft tokens checked in this step
+    num_accepted: int = 0  # and accepted
 
 
 class LLMEngine:
@@ -53,10 +60,16 @@ class LLMEngine:
             raise ValueError("chunked_prefill needs kv='paged', attention='triton' and batching='continuous'")
         if cfg.chunked_prefill and cfg.max_num_batched_tokens < cfg.max_num_seqs:
             raise ValueError("chunked_prefill needs max_num_batched_tokens >= max_num_seqs, so every decode fits")
+        if cfg.spec not in (None, "ngram"):
+            raise ValueError(f"unknown spec method {cfg.spec}")
+        # drafts are checked by the paged prefill kernel, which reads the context from the pool
+        if cfg.spec and (cfg.attention != "triton" or cfg.prefix_caching or cfg.chunked_prefill):
+            raise ValueError("spec needs attention='triton', and is not combined with prefix caching or chunked prefill")
         self.cfg = cfg
         torch.cuda.init()
         cap_gpu_memory()
         self.runner = ModelRunner(cfg)
+        self.proposer = NgramProposer() if cfg.spec == "ngram" else None
         self.reset()
 
     def reset(self):
@@ -94,6 +107,8 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return []
+        if self.proposer is not None and not is_prefill:
+            return self._step_spec(seqs)
         start = time.perf_counter()
         tokens = self.runner.run(seqs, is_prefill)
         now = time.perf_counter()
@@ -123,22 +138,51 @@ class LLMEngine:
         self.steps.append(record)
         return finished
 
+    def _step_spec(self, seqs):
+        drafts = []
+        for seq in seqs:
+            # never more tokens than max_tokens allows: the drafts plus one from the target model
+            k = min(self.cfg.num_spec_tokens, seq.params.max_tokens - seq.num_completion_tokens - 1)
+            d = self.proposer.propose(seq, k) if k > 0 else []
+            while d and not self.kv.can_append(seq, len(d)):  # drafts only take blocks that are free
+                d.pop()
+            self.kv.append(seq, len(d))
+            drafts.append(d)
+        start = time.perf_counter()
+        tokens = self.runner.run_verify(seqs, drafts)
+        now = time.perf_counter()
+        record = StepRecord(start, now, False, len(seqs), sum(len(d) + 1 for d in drafts), self._kv_used(),
+                            self.kv.allocated_slots(), len(seqs), sum(map(len, drafts)), sum(len(t) - 1 for t in tokens))
+        finished = []
+        for seq, toks in zip(seqs, tokens):
+            for tok in toks:
+                if self._append_token(seq, tok, now):
+                    finished.append(seq)
+                    break
+            else:
+                seq.num_computed_tokens = len(seq) - 1
+                self.kv.truncate(seq)
+        self.steps.append(record)
+        return finished
+
     def _kv_used(self):
         return sum(len(s) for s in self.scheduler.running)  # before this step's new tokens are appended
 
     def _append(self, seqs, tokens, now):
-        finished = []
-        for seq, tok in zip(seqs, tokens):
-            seq.token_ids.append(tok)
-            seq.token_times.append(now)
-            if seq.first_token_time is None:
-                seq.first_token_time = now
-            done = seq.num_completion_tokens >= seq.params.max_tokens
-            if done or (not seq.params.ignore_eos and tok in self.runner.eos_token_ids):
-                seq.finish_time = now
-                self.scheduler.finish(seq)
-                finished.append(seq)
-        return finished
+        return [seq for seq, tok in zip(seqs, tokens) if self._append_token(seq, tok, now)]
+
+    def _append_token(self, seq, tok, now):
+        """Appends a generated token; returns whether seq finished with it."""
+        seq.token_ids.append(tok)
+        seq.token_times.append(now)
+        if seq.first_token_time is None:
+            seq.first_token_time = now
+        done = seq.num_completion_tokens >= seq.params.max_tokens
+        if done or (not seq.params.ignore_eos and tok in self.runner.eos_token_ids):
+            seq.finish_time = now
+            self.scheduler.finish(seq)
+            return True
+        return False
 
     def generate(self, prompts, params) -> list[Sequence]:
         """Offline use: runs all prompts to completion. params is one SamplingParams or one per prompt."""

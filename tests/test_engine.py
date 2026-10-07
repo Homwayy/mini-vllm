@@ -17,6 +17,9 @@ Chunked prefill runs with a budget of 64 tokens per step, so prompts of up to 30
 several chunks and mixed with decoding; mixed steps run in CUDA graphs too, so the eager comparison covers
 them. A small pool preempts sequences in the middle of their prompts.
 
+Speculative decoding (n-gram drafts) runs on prompts that repeat a segment, so drafts are found; the check
+requires both accepted and rejected drafts. Verify steps run in CUDA graphs too.
+
 Run from the repo root: python -m tests.test_engine
 """
 
@@ -65,6 +68,16 @@ def shared_prefix_requests(n, vocab, max_out, seed=2):
     return prompts, params
 
 
+def repetitive_requests(n, vocab, max_out, seed=4):
+    rng = random.Random(seed)
+    prompts = []
+    for _ in range(n):
+        segment = [rng.randrange(vocab) for _ in range(rng.randint(3, 12))]
+        prompts.append(segment * rng.randint(2, 6) + [rng.randrange(vocab) for _ in range(rng.choice([0, 1, 5]))])
+    params = [SamplingParams(temperature=0.0, max_tokens=rng.randint(5, max_out), ignore_eos=True) for _ in range(n)]
+    return prompts, params
+
+
 @torch.inference_mode()
 def replay_regret(model, seqs):
     """Max regret of the generated tokens under a reference forward, and the share that are exact argmaxes."""
@@ -103,15 +116,19 @@ def run_case(engine, prompts, params, label):
     ok = lengths_ok and released and regret <= MAX_REGRET
     cached = sum(s.num_cached_tokens for s in seqs)
     mixed = sum(r.is_prefill and r.num_decode > 0 for r in engine.steps)
+    drafted, accepted = sum(r.num_draft for r in engine.steps), sum(r.num_accepted for r in engine.steps)
     if engine.cfg.prefix_caching:
         ok &= cached > 0
     if engine.cfg.chunked_prefill:
         ok &= mixed > 0
+    if engine.cfg.spec:
+        ok &= 0 < accepted < drafted
     print(
         f"{label:58s} regret max {regret:.3f}, exact argmax {exact:.3f}, preemptions {engine.scheduler.num_preemptions:3d}, "
         f"prefill steps {prefills:3d}, max decode batch {max_batch:2d}, lengths {'ok' if lengths_ok else 'WRONG'}, "
         f"KV {'released' if released else 'LEAKED'}" + (f", cached prompt tokens {cached}" if engine.cfg.prefix_caching else "")
         + (f", mixed steps {mixed}" if engine.cfg.chunked_prefill else "")
+        + (f", drafts accepted {accepted} / {drafted}" if engine.cfg.spec else "")
     )
     graph_tokens = [s.token_ids for s in seqs]
     engine.reset()
@@ -189,6 +206,30 @@ def main():
     torch.cuda.empty_cache()
     engine = LLMEngine(EngineConfig(**{**gcfg.__dict__, "attention": "flex"}))
     ok &= run_case(engine, prompts, params, "gpt2 flex {'kv': 'paged', 'batching': 'continuous'}")
+    del engine
+    torch.cuda.empty_cache()
+
+    spec_cfg = EngineConfig(**{**gcfg.__dict__, "spec": "ngram"})
+    engine = LLMEngine(spec_cfg)
+    rep_prompts, rep_params = repetitive_requests(24, 50257, 80)
+    for case in (CASES[2], CASES[4], CASES[1]):
+        engine.cfg = EngineConfig(**{**spec_cfg.__dict__, **case})
+        engine.reset()
+        ok &= run_case(engine, rep_prompts, rep_params, f"gpt2 {gcfg.attention} {case} spec ngram")
+    engine.cfg = spec_cfg
+    engine.reset()
+    sampled = [SamplingParams(temperature=0.6, top_p=0.9, max_tokens=p.max_tokens, ignore_eos=True) for p in rep_params]
+    seqs = engine.generate(rep_prompts, sampled)
+    sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
+    accepted = sum(r.num_accepted for r in engine.steps)
+    print(f"gpt2 spec ngram sampling (temperature 0.6, top_p 0.9): lengths {'ok' if sample_ok else 'WRONG'}, "
+          f"drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}")
+    ok &= sample_ok and accepted > 0
+    del engine
+    torch.cuda.empty_cache()
+    engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "spec": "ngram"}))
+    rep_prompts, rep_params = repetitive_requests(24, 10000, 80, seed=5)
+    ok &= run_case(engine, rep_prompts, rep_params, f"qwen3 {cfg.attention} {{'kv': 'paged', 'batching': 'continuous'}} spec ngram")
     print("PASS" if ok else "FAIL")
 
 

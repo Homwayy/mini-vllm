@@ -15,22 +15,29 @@ class Sampler:
 
     @torch.no_grad()
     def __call__(self, logits, params: list[SamplingParams]):
+        probs, greedy = self.probs(logits, params)
+        if probs is None:
+            return greedy
+        sampled = probs.div_(torch.empty_like(probs).exponential_()).argmax(dim=-1)
+        is_greedy = torch.tensor([p.temperature == 0 for p in params], device=probs.device)
+        return torch.where(is_greedy, greedy, sampled)
+
+    @torch.no_grad()
+    def probs(self, logits, params: list[SamplingParams]):
+        """Returns (each row's distribution after temperature, top-k and top-p, or None if every row is
+        greedy; each row's argmax)."""
         logits = logits.float()
         if self.vocab_limit is not None:
             logits[:, self.vocab_limit :] = float("-inf")
         greedy = logits.argmax(dim=-1)
         temps = [p.temperature for p in params]
         if all(t == 0 for t in temps):
-            return greedy
-        device = logits.device
-        t = torch.tensor([t if t > 0 else 1.0 for t in temps], device=device)
+            return None, greedy
+        t = torch.tensor([t if t > 0 else 1.0 for t in temps], device=logits.device)
         logits = logits / t[:, None]
         if any(p.top_k > 0 or p.top_p < 1.0 for p in params):
             logits = self.top_k_top_p(logits, params)
-        probs = torch.softmax(logits, dim=-1)
-        sampled = probs.div_(torch.empty_like(probs).exponential_()).argmax(dim=-1)
-        is_greedy = torch.tensor([t == 0 for t in temps], device=device)
-        return torch.where(is_greedy, greedy, sampled)
+        return torch.softmax(logits, dim=-1), greedy
 
     @staticmethod
     def top_k_top_p(logits, params):
