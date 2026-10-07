@@ -26,10 +26,11 @@ def main():
     ap.add_argument("--attention", default="flex")
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 48])
     ap.add_argument("--steps", type=int, default=50)
+    ap.add_argument("--max-num-seqs", type=int, default=256, help="largest decode graph; gather needs 64 to fit in memory")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    engine = LLMEngine(EngineConfig(attention=args.attention))
+    engine = LLMEngine(EngineConfig(attention=args.attention, max_num_seqs=args.max_num_seqs))
     engine.warmup()
     rows = []
     for B in args.batches:
@@ -52,7 +53,7 @@ def main():
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"attention": args.attention, "prompt_len": PROMPT_LEN, "steps": args.steps,
+        json.dump({"attention": args.attention, "prompt_len": PROMPT_LEN, "steps": args.steps, "max_num_seqs": args.max_num_seqs,
                    "gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "rows": rows}, f, indent=1)
     print("wrote", args.out)
 
