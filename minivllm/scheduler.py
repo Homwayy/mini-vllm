@@ -121,6 +121,7 @@ class Scheduler:
     def _preempt(self, seq: Sequence):
         self.kv.release(seq)
         seq.num_computed_tokens = 0
+        seq.draft_tokens, seq.draft_probs = [], None
         seq.status = Status.WAITING
         seq.num_preemptions += 1
         self.num_preemptions += 1
@@ -129,6 +130,8 @@ class Scheduler:
     def finish(self, seq: Sequence):
         self.kv.release(seq)
         seq.status = Status.FINISHED
+        # the draft distributions are a view of their whole step's tensor, which they would keep alive
+        seq.draft_tokens, seq.draft_probs = [], None
         self.running.remove(seq)
         if not self.running:
             self.filling = True

@@ -249,9 +249,11 @@ def main():
         seqs = engine.generate(prompts, sampled)
         sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
         accepted = sum(r.num_accepted for r in engine.steps)
+        dropped = all(s.draft_probs is None for s in seqs)  # finished sequences keep no draft distributions
         print(f"gpt2 spec eagle sampling (temperature 0.8, top_p 0.95): lengths {'ok' if sample_ok else 'WRONG'}, "
-              f"drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}")
-        ok &= sample_ok and accepted > 0
+              f"drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}, "
+              f"draft distributions {'dropped' if dropped else 'KEPT'}")
+        ok &= sample_ok and accepted > 0 and dropped
     else:
         print(f"spec eagle: skipped, no draft model at {eagle_cfg.draft_path}")
     print("PASS" if ok else "FAIL")
