@@ -34,7 +34,8 @@ class EagleDraft(nn.Module):
         self.target = (target.wte, target.cos, target.sin, rows)
 
     def init_as_copy(self):
-        """Starts as g_t = f_t: the feature half of fc is the identity and the block adds nothing."""
+        """Starts near g_t = f_t: the feature half of fc is the identity, and the block adds only the biases of
+        its two output projections, whose weights are zero."""
         d = self.fc.out_features
         with torch.no_grad():
             self.fc.weight.zero_()
