@@ -1,4 +1,4 @@
-"""Decode step time inside the engine (E4): CUDA graphs on, Qwen3, every sequence with a 1024-token prompt.
+"""Decode step time inside the engine (E4, E5): Qwen3, every sequence with a 1024-token prompt.
 
 For each batch size, that many requests are prefilled, a few decode steps run as warm-up, and then the
 wall time of --steps decode steps (sampling included) is measured. The context grows from about 1030 to
@@ -27,10 +27,11 @@ def main():
     ap.add_argument("--batches", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32, 48])
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--max-num-seqs", type=int, default=256, help="largest decode graph; gather needs 64 to fit in memory")
+    ap.add_argument("--no-cuda-graph", action="store_true", help="launch the decode kernels from Python every step")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    engine = LLMEngine(EngineConfig(attention=args.attention, max_num_seqs=args.max_num_seqs))
+    engine = LLMEngine(EngineConfig(attention=args.attention, max_num_seqs=args.max_num_seqs, cuda_graph=not args.no_cuda_graph))
     engine.warmup()
     rows = []
     for B in args.batches:
@@ -49,11 +50,13 @@ def main():
         torch.cuda.synchronize()
         ms = (time.perf_counter() - t) / args.steps * 1e3
         rows.append({"batch": B, "step_ms": ms, "tokens_per_s": B / ms * 1e3})
-        print(f"{args.attention}: batch {B:3d}, decode step {ms:6.2f} ms, {B / ms * 1e3:7.0f} token/s", flush=True)
+        print(f"{args.attention}{'' if engine.runner.use_cuda_graph else ' (no graph)'}: batch {B:3d}, "
+              f"decode step {ms:6.2f} ms, {B / ms * 1e3:7.0f} token/s", flush=True)
 
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
     with open(args.out, "w") as f:
-        json.dump({"attention": args.attention, "prompt_len": PROMPT_LEN, "steps": args.steps, "max_num_seqs": args.max_num_seqs,
+        json.dump({"attention": args.attention, "cuda_graph": not args.no_cuda_graph, "prompt_len": PROMPT_LEN, "steps": args.steps,
+                   "max_num_seqs": args.max_num_seqs,
                    "gpu": torch.cuda.get_device_name(), "torch": torch.__version__, "rows": rows}, f, indent=1)
     print("wrote", args.out)
 
