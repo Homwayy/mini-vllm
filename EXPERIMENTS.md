@@ -2,7 +2,7 @@
 
 从零写一个小型 LLM 推理引擎（mini vLLM），在一张 12 GB 的笔记本 GPU 上服务 Qwen3-0.6B，逐项对比 KV cache 的管理方式、调度策略和注意力实现对吞吐和延迟的影响。
 
-目前完成了 E0（正确性）到 E4。在固定的离线负载 W1（256 条请求）上：
+目前完成了 E0（正确性）到 E4b。在固定的离线负载 W1（256 条请求）上：
 
 - **E1（基线）：** 静态批处理的起点是 1760 输出 token/s，是 HF transformers 静态批处理（160 token/s）的 11.0 倍；但 KV 池里平均只有 26.2% 的槽位存着 token。
 - **E2（分页 KV）：** KV 改成分页以后，KV 利用率从 52% 提高到 99%，同一批能放的序列从 32 条提高到最多 60 条，吞吐提高 24.9%，到 2204 token/s。提升受限于静态批处理的尾部：每批都要等其中最长的请求。
@@ -11,6 +11,9 @@
 - **E4（注意力实现）：** 自己用 Triton 写了分页 decode 注意力。
   - batch 1–8 时，单层注意力比 FlexAttention 快 1.4–8.1 倍。原因是 flex 的 mask 里有完整块时，它按整个 KV 池的长度切分工作，短序列全落在同一段里。
   - batch ≥ 16 时，两者都接近显存带宽（约 600 GB/s），所以 W1（decode batch 约 46）上吞吐只高 1.2%。
+- **E4b（prefill 也换成 Triton）：** 新的 prefill kernel 从池里读全部 K/V，所以也能接在已缓存的前缀后面，这是 E6–E8 的前提。
+  - 单层 prefill 是 flex 的 1.9–2.5 倍，16 × 1024 时 47.6 TFLOPS，为矩阵乘峰值的 78%。
+  - prefill 注意力只占 W1 总时间的约 1%，所以吞吐只多 0.49%。
 
 在请求陆续到达的在线负载 W2 上：
 
@@ -25,7 +28,7 @@
   - E0：[tests/test_qwen3_hf.py](tests/test_qwen3_hf.py)、[tests/test_gpt2_nanogpt.py](tests/test_gpt2_nanogpt.py)。
   - W1 的吞吐：[bench/bench_offline.py](bench/bench_offline.py)；E1 里 HF 的那组用 [bench/bench_hf.py](bench/bench_hf.py)。
   - W2 的延迟：[bench/bench_online.py](bench/bench_online.py)。
-  - E4 的单层注意力和单步 decode：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)。
+  - E4 的单层注意力和单步 decode：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)。
 - 负载文件在 [bench/workloads/](bench/workloads/)，由 [bench/workloads.py](bench/workloads.py) 用固定的 seed 生成。
 - 第 3 节记录实现上的设计决策。其中的数字除了注明来自 results/ 的，都来自单独的检查脚本（没有放进仓库），只用来说明设计的原因；需要作为结论的数字，会在后面的实验里正式测量。
 
@@ -111,6 +114,7 @@
 | E3b | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=optimistic` | 2571、2575 token/s（对照组 2620、2609） | 62.5 / 116 | 0.992 | 0.862 | 8.61 GiB |
 | E3c | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=headroom` | **2719 token/s**（对照组 2571、2575） | 61.9 / 113 | 0.992 | 0.854 | 8.61 GiB |
 | E4 | 2026-10-07 | `dc8c94d` | E3 的配置，`attention=triton-decode`（当时叫 `triton`） | 2587 token/s（对照组 2555、2557） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
+| E4b | 2026-10-07 | `c8b920b` | E4 的配置，`attention=triton`（prefill 也用 Triton） | 2704 token/s（对照组 2691、2690） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
@@ -454,6 +458,69 @@
 - **W1 再要变快只能少读：** W1 的 decode 已经被读 K/V 的带宽限制。batch 48 时，注意力约占每步的 58%（345.9 µs × 28 层 = 9.7 ms，每步 16.84 ms），要再快，只能少读 K/V（例如把 KV 量化）。
 - **后面的实验改用 Triton 的 decode。** 当时 prefill 还是 flex，只看这一步新来的 token；E6（前缀缓存）和 E7（分块 prefill）需要 prefill 也读池里已有的 KV，所以接着把 prefill 也换成了 Triton（E4b）。
 
+### E4b：prefill 也换成 Triton
+
+- **改动：** 在 E4 的引擎上，只把 prefill 的注意力从 FlexAttention 换成自己写的 Triton 分页 prefill kernel（设计见 3.5），即 `attention=triton-decode` 换成 `attention=triton`。
+  - 新 kernel 的 K/V 全部按 block table 从池里读，所以每条序列前面可以接一段已缓存的前缀。前缀缓存（E6）、分块 prefill（E7）和投机解码的验证（E8）都要用到这一点。
+  - 这一节只看它在没有缓存的普通 prefill 上的速度。
+- **测了两层：**
+  - **单层 prefill 注意力**（[bench/bench_prefill.py](bench/bench_prefill.py)）：
+    - 测法和 E4 的单层注意力相同：几层录进一个 CUDA graph，每层读不同的块，每次回放至少读 256 MiB 的 K/V；两种实现轮流测 5 轮，取中位数。
+    - 新 token 的 K/V 先写进池里，两种实现看到的 K/V 相同，输出的最大差是 0.004–0.008。
+    - 带缓存前缀的形状 flex 做不了，只测 Triton，作为 E6–E8 的参照。
+    - TFLOPS 按因果注意力实际的计算量算：每个新 token 和它能看到的每个 key 各算一次 QK 和 PV。参照：8192³ 的 bf16 矩阵乘是 61.4 TFLOPS。
+  - **W1：** 负载和测法都和 E3 相同。
+- **运行条件：** 2026-10-07，代码版本 `c8b920b`。单层 prefill 单独运行；W1 在同一次测试里依次运行 `triton-decode`、`triton`、`triton-decode`，每组预热后跑 3 次。
+
+**单层 prefill 注意力**（每层的耗时；括号里是 TFLOPS）：
+
+| 序列数 × 新 token 数 | 前面已缓存 | flex | Triton | flex ÷ Triton |
+|---|---|---|---|---|
+| 1 × 128 | — | 12.3 µs（5.5） | 12.0 µs（5.6） | 1.02 |
+| 1 × 1024 | — | 221.3 µs（19.4） | 117.6 µs（36.6） | 1.88 |
+| 4 × 1024 | — | 741.9 µs（23.2） | 394.7 µs（43.6） | 1.88 |
+| 16 × 1024 | — | 2835.3 µs（24.3） | 1443.8 µs（47.6） | 1.96 |
+| 26 × 100–1024 | — | 2783.7 µs（16.6） | 1124.9 µs（41.2） | 2.47 |
+| 1 × 512 | 1536 | — | 217.1 µs（34.6） | — |
+| 16 × 256 | 各 768 | — | 630.9 µs（47.7） | — |
+| 64 × 16 | 各 1008 | — | 451.5 µs（18.9；595 GB/s） | — |
+| 64 × 4 | 各 1020 | — | 471.9 µs（4.5；569 GB/s） | — |
+| 8 × 4 | 各 1020 | — | 60.2 µs（4.4；557 GB/s） | — |
+
+- **26 × 100–1024：** 和 W1 一样，prompt 长度在 100–1024 之间均匀随机（固定 seed），共 15,673 个 token，接近一步 16,384 个 token 的上限。
+- **最后三行：** 每条序列只有 4–16 个新 token，计算量小，主要是读 K/V，所以括号里也给出有效带宽。
+
+**W1：**
+
+| | triton-decode（前） | triton | triton-decode（后） |
+|---|---|---|---|
+| 输出吞吐（3 次的中位数） | 2691.5 token/s | **2703.7 token/s** | 2689.8 token/s |
+| 3 次之间的差距 | 0.52% | 0.13% | 0.19% |
+| prefill 步数 / 总耗时 | 162 / 6.71 s | 162 / 6.31 s | 162 / 6.63 s |
+| 每个 decode 步的耗时 | 14.19 ms | 14.24 ms | 14.23 ms |
+| TTFT p50 | 18.2 s | 18.0 s | 18.2 s |
+| TPOT p50 / p99 | 18.0 / 19.4 ms | 17.9 / 19.3 ms | 18.0 / 19.4 ms |
+
+- **表中的数：** 输出吞吐是 3 次的中位数，其他的数取吞吐处在中位数的那一次。三组的 decode batch 都是平均 46.7、最多 60，KV 利用率都是 0.992，显存峰值都是 8.63 GiB。
+
+结果：
+
+- **单层：prefill 是 flex 的 1.9–2.5 倍。**
+  - 16 × 1024 时 47.6 TFLOPS，为矩阵乘峰值的 78%；flex 在 1024 个 token 以上的形状只有 16.6–24.3 TFLOPS。flex 用的是 Inductor 的默认配置（没有开 max-autotune），没有再调。
+  - 混合长度时差距最大（2.47 倍）。推测是因为 flex 的 prefill mask 以 128 个 token 为一块，跨序列边界的块要逐个元素算 mask，块里属于别的序列的部分也要算；Triton 的 tile 不跨序列。
+  - 1 × 128 时两者持平（约 12 µs），规模太小，GPU 填不满。
+- **每条序列只有几个新 token 时，耗时就是读一遍 K/V。**
+  - 64 × 4、64 × 16 和 8 × 4 的有效带宽是 557–595 GB/s，接近显存读带宽，可以直接用来验证投机解码的草稿 token（E8）。
+  - 这个 kernel 不切分上下文，每个程序读完整条序列。batch 1–2 时没有测，推测会像 E4 里小 batch 的 flex 一样慢，E8 用到时再加分段。
+- **W1：吞吐提高 0.49%。** 2703.7 对 2690.6 token/s（前后两组对照的平均，两组只差 0.06%）。
+  - prefill 的总耗时从 6.63–6.71 s 降到 6.31 s，少了约 0.36 s。
+  - **按单层测试推算：** W1 的 256 条 prompt 在 28 层里的 prefill 注意力共 11.9 TFLOP。按 flex 的 16.6–24.3 TFLOPS 要 0.49–0.72 s，按 Triton 的 36.6–47.6 TFLOPS 要 0.25–0.33 s，差 0.17–0.47 s（估算），和实测一致。
+  - prefill 注意力本来只占 W1 总时间的约 1%，所以吞吐提高得不多。
+  - decode 不受影响（每步 14.19–14.24 ms）。
+- **不同测试之间的差别比这次的改动大得多：** 同一个 `triton-decode` 配置，E4 那次测试里是 2586.6 token/s，这次是 2690.6，高 4.0%，是这次改动的 8 倍。所以每次改动都只和同一次测试里的对照组比。
+
+**结论：** 自己写的 prefill kernel 比 flex 快约 2 倍，但 prefill 注意力在 W1 里只占约 1% 的时间，吞吐只多 0.5%。这一步的主要目的是让 prefill 能接在已缓存的前缀后面，E6（前缀缓存）直接在这上面做。
+
 ## 3. 工程记录与设计决策
 
 ### 3.1 用 FlexAttention 做分页注意力
@@ -490,9 +557,9 @@
 - 不录图时，每一步的 kernel 都要由 CPU 逐个提交，batch 1 和 batch 35 的耗时几乎一样；用 profiler 看，batch 35 时 GPU 只有不到一半的时间在算。这时吞吐几乎和 batch 大小成正比，会夸大分页和连续批处理的收益，所以 E1–E3 都在录图的引擎上测（见第 1 节）。
 - E5 会在最终的引擎上正式比较录图和不录图。
 
-### 3.5 Triton 分页 decode kernel
+### 3.5 Triton 分页注意力的 kernel
 
-代码在 [minivllm/attention/triton_paged.py](minivllm/attention/triton_paged.py)，由两个 kernel 组成：
+代码在 [minivllm/attention/triton_paged.py](minivllm/attention/triton_paged.py)。decode 由两个 kernel 组成：
 
 - **分段计算（FlashDecoding）：**
   - 第一个 kernel 的每个程序负责一条序列、一个 KV 头的一段上下文：按 block table 直接从池里读这一段的 K/V，每次读 32 个 token（两页），用在线 softmax 累加。指数用 exp2，缩放因子里预先乘上 log2 e。输出是这一段归一化以后的结果和 log-sum-exp。
@@ -506,6 +573,20 @@
   - grid 只取决于 batch 大小和 block table 的宽度（最大上下文长度）。超出序列长度的段输出空结果，log-sum-exp 为 −inf，合并时权重为 0。
   - 中间结果的缓冲区每个 batch 大小分配一次，地址固定。
 - **单次调用的误差和 flex 相同：** 单独检查时，在 E0 的 Qwen3 生成过程中，把每一次 decode 注意力调用的输入取出来，和 fp32 参照比较。相对误差的中位数是 Triton 2.17e-3、flex 2.15e-3，最大值是 4.95e-3 和 4.12e-3。
+
+prefill 是一个 kernel，每条序列可以有任意多个新 token：
+
+- **新 token 是序列的最后几个：** 它们的 K/V 在注意力之前已经写进池里，前面可以有已缓存的前缀。第 i 个新 token 看到这条序列里位置不超过自己的所有 key。
+- **tile：** 每个程序负责一条序列的一段新 token、一个 KV 头。共用这个 KV 头的 2 个 query 头作为额外的行（128 行 = 64 个 token × 2 个头），每块 K/V 只读一次。
+- **程序和序列的对应：**
+  - 序列 b 从第 `cu_seqlens[b] // 每个 tile 的 token 数 + b` 个程序开始，每个程序用二分查找确定自己属于哪条序列。
+  - 这样 grid 只取决于新 token 的总数和序列数，和每条序列的长度无关；多出来的程序直接退出。
+- **两段循环：** tile 之前的 key 对 tile 里的每一行都可见，不用 mask；只有靠近对角线的几块 key 才算因果 mask。
+- **先算重的 tile：** 一条序列越靠后的 tile 要看的 key 越多，所以程序按倒序取 tile。单独检查时，单条 1024 个 token 比正序快 10%。
+- **tile 的行数随新 token 数变化：**
+  - 一般是 128 行。每条序列最多只有 4–16 个新 token 时（例如验证草稿 token），用 16–32 行，单独检查时比 128 行快 35–60%。
+  - 其他配置（每次读 32 个 key、4 个 warp、2 级流水线）是在 16–128 行、每次 32–64 个 key、4–8 个 warp、1–3 级流水线的组合上扫描后选的。
+- **只编译一次：** 序列数和 block table 的宽度每步都不一样，而 Triton 默认会按整数参数是否为 1、能否被 16 整除分别编译。对这两个参数关掉特化以后，所有 prefill 步共用一个编译好的 kernel，不会在运行中途编译。
 
 ### 3.6 测单层注意力时要避开 L2
 
@@ -530,6 +611,7 @@
 | E3b | 乐观准入（`admission=optimistic`），不预留，块不够时抢占并重算 | E3 | W1 | 已完成：反复抢占，吞吐低 1.6%，见第 2 节 |
 | E3c | 乐观准入加余量（`admission=headroom`） | E3b | W1 | 已完成：吞吐比 E3b 高 5.7%、比 E3 高 4.0%，TPOT 的 p99 变成 2.4 倍；后面仍用 reserve，见第 2 节 |
 | E4 | 注意力的消融：gather、FlexAttention、自己用 Triton 写的分页注意力 | FlexAttention | 单层注意力；单步 decode；W1、W2 | 已完成：单层注意力在 batch 1–8 时快 1.4–8.1 倍，batch ≥ 16 时持平（都接近显存带宽）；W1 吞吐提高 1.2%，W2 低负载下 TPOT 中位数降低 19–26%，见第 2 节 |
+| E4b | prefill 也换成自己写的 Triton 分页 kernel（`attention=triton`） | `attention=triton-decode` | 单层 prefill；W1 | 已完成：单层 prefill 是 flex 的 1.9–2.5 倍；W1 吞吐提高 0.49%，见第 2 节 |
 | E5 | CUDA graph 的消融：关掉录图 | 录图 | W1；batch 1 | 待做 |
 | E6 | 前缀缓存 | 不开 | W3 | 待做 |
 | E7 | 分块 prefill | 不分块 | W2 | 待做 |
