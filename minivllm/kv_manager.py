@@ -44,7 +44,7 @@ class ContiguousKV:
     def append(self, seq: Sequence, extra=0):
         pass
 
-    def truncate(self, seq: Sequence):
+    def truncate(self, seq: Sequence, extra=0):
         pass
 
     def release(self, seq: Sequence):
@@ -101,9 +101,9 @@ class PagedKV:
         for _ in range(cdiv(len(seq) + extra, self.block_size) - len(seq.block_table)):
             seq.block_table.append(self.free_blocks.popleft())
 
-    def truncate(self, seq: Sequence):
-        """Frees the blocks past seq's tokens, which only held rejected draft tokens."""
-        while len(seq.block_table) > cdiv(len(seq), self.block_size):
+    def truncate(self, seq: Sequence, extra=0):
+        """Frees the blocks past seq's tokens and `extra` more, which only held rejected draft tokens."""
+        while len(seq.block_table) > cdiv(len(seq) + extra, self.block_size):
             self.free_blocks.append(seq.block_table.pop())
 
     def release(self, seq: Sequence):

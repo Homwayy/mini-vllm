@@ -124,7 +124,7 @@ def main():
     ap.add_argument("--lr", type=float, default=6e-4)
     ap.add_argument("--min-lr", type=float, default=6e-5)
     ap.add_argument("--warmup", type=int, default=300)
-    ap.add_argument("--passes", type=int, default=3)
+    ap.add_argument("--passes", type=int, default=4)
     ap.add_argument("--noise", type=float, default=0.1)
     ap.add_argument("--cls-weight", type=float, default=1.0)
     ap.add_argument("--eval-every", type=int, default=1000)

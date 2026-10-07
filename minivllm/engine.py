@@ -1,3 +1,4 @@
+import os
 import time
 from dataclasses import dataclass
 
@@ -6,7 +7,7 @@ import torch
 from minivllm.kv_manager import ContiguousKV, PagedKV, PrefixCachingKV, cdiv
 from minivllm.model_runner import ModelRunner
 from minivllm.scheduler import Scheduler
-from minivllm.sequence import SamplingParams, Sequence
+from minivllm.sequence import SamplingParams, Sequence, Status
 from minivllm.spec.ngram import NgramProposer
 from minivllm.utils import cap_gpu_memory
 
@@ -24,10 +25,12 @@ class EngineConfig:
     # mix prompt chunks with decoding in steps of at most max_num_batched_tokens (paged, triton, continuous)
     chunked_prefill: bool = False
     cuda_graph: bool = True  # capture the decode step per batch-size bucket
-    # speculative decoding: "ngram" drafts up to num_spec_tokens tokens per sequence and decode step, and the
-    # target model checks them all in that step (attention="triton", without prefix caching or chunked prefill)
+    # speculative decoding: up to num_spec_tokens draft tokens per sequence and decode step, which the target
+    # model checks all in that step (attention="triton", without prefix caching or chunked prefill). "ngram"
+    # copies them from earlier in the sequence; "eagle" drafts with the model in draft_path (gpt2 only).
     spec: str | None = None
     num_spec_tokens: int = 4
+    draft_path: str = os.path.join("checkpoints", "gpt2_eagle.pt")
     block_size: int = 16
     num_kv_blocks: int = 4096
     max_num_seqs: int = 256
@@ -60,8 +63,10 @@ class LLMEngine:
             raise ValueError("chunked_prefill needs kv='paged', attention='triton' and batching='continuous'")
         if cfg.chunked_prefill and cfg.max_num_batched_tokens < cfg.max_num_seqs:
             raise ValueError("chunked_prefill needs max_num_batched_tokens >= max_num_seqs, so every decode fits")
-        if cfg.spec not in (None, "ngram"):
+        if cfg.spec not in (None, "ngram", "eagle"):
             raise ValueError(f"unknown spec method {cfg.spec}")
+        if cfg.spec == "eagle" and cfg.model != "gpt2":
+            raise ValueError("the EAGLE draft model is trained for model='gpt2'")
         # drafts are checked by the paged prefill kernel, which reads the context from the pool
         if cfg.spec and (cfg.attention != "triton" or cfg.prefix_caching or cfg.chunked_prefill):
             raise ValueError("spec needs attention='triton', and is not combined with prefix caching or chunked prefill")
@@ -107,7 +112,7 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
             return []
-        if self.proposer is not None and not is_prefill:
+        if self.cfg.spec and not is_prefill:
             return self._step_spec(seqs)
         start = time.perf_counter()
         tokens = self.runner.run(seqs, is_prefill)
@@ -118,6 +123,9 @@ class LLMEngine:
         for seq in seqs:
             seq.num_computed_tokens = len(seq)
         finished = self._append(seqs, tokens, now)
+        if self.cfg.spec == "eagle":  # a prefill: the draft model's prefill, and the first drafts
+            self._draft([(i, seq, len(seq) - 1) for i, seq in enumerate(seqs) if seq.status == Status.RUNNING])
+            record.end = time.perf_counter()
         self.steps.append(record)
         return finished
 
@@ -141,29 +149,63 @@ class LLMEngine:
     def _step_spec(self, seqs):
         drafts = []
         for seq in seqs:
-            # never more tokens than max_tokens allows: the drafts plus one from the target model
-            k = min(self.cfg.num_spec_tokens, seq.params.max_tokens - seq.num_completion_tokens - 1)
-            d = self.proposer.propose(seq, k) if k > 0 else []
+            k = self._max_drafts(seq)
+            if self.proposer is not None:
+                d = self.proposer.propose(seq, k) if k > 0 else []
+            else:
+                d = seq.draft_tokens[:k]  # EAGLE: drafted at the end of this sequence's previous step
             while d and not self.kv.can_append(seq, len(d)):  # drafts only take blocks that are free
                 d.pop()
             self.kv.append(seq, len(d))
             drafts.append(d)
+        probs = None
+        if self.cfg.spec == "eagle" and any(seq.params.temperature > 0 for seq in seqs):
+            probs = [seq.draft_probs for seq in seqs]
         start = time.perf_counter()
-        tokens = self.runner.run_verify(seqs, drafts)
+        tokens = self.runner.run_verify(seqs, drafts, probs)
         now = time.perf_counter()
         record = StepRecord(start, now, False, len(seqs), sum(len(d) + 1 for d in drafts), self._kv_used(),
                             self.kv.allocated_slots(), len(seqs), sum(map(len, drafts)), sum(len(t) - 1 for t in tokens))
-        finished = []
-        for seq, toks in zip(seqs, tokens):
+        finished, verified = [], []
+        for i, (seq, toks) in enumerate(zip(seqs, tokens)):
             for tok in toks:
                 if self._append_token(seq, tok, now):
                     finished.append(seq)
                     break
             else:
                 seq.num_computed_tokens = len(seq) - 1
+                verified.append((i, seq, len(toks)))  # the rows of its last token and its accepted drafts
+        if self.cfg.spec == "eagle":
+            self._draft(verified)
+            record.end = time.perf_counter()
+        else:
+            for _, seq, _ in verified:
                 self.kv.truncate(seq)
         self.steps.append(record)
         return finished
+
+    def _max_drafts(self, seq):
+        # never more tokens than max_tokens allows: the drafts plus one from the target model
+        return min(self.cfg.num_spec_tokens, seq.params.max_tokens - seq.num_completion_tokens - 1)
+
+    def _draft(self, entries):
+        """EAGLE: entries is [(row of the sequence in this step, sequence, number of its verified rows)]. Catches
+        the draft model up on those rows and drafts the sequences' next tokens, with blocks reserved for them."""
+        keep = []
+        for i, seq, n in entries:
+            k = self._max_drafts(seq)
+            while k > 0 and not self.kv.can_append(seq, k):
+                k -= 1
+            self.kv.truncate(seq, k)
+            seq.draft_tokens, seq.draft_probs = [], None
+            if k > 0:  # without drafts, the block for the next token is left to the scheduler, which can preempt
+                self.kv.append(seq, k)
+                keep.append((i, n, seq, k))
+        if keep:
+            drafts, probs = self.runner.draft_next([(i, n) for i, n, _, _ in keep])
+            for j, (_, _, seq, k) in enumerate(keep):
+                seq.draft_tokens = drafts[j][:k]
+                seq.draft_probs = None if probs is None else probs[j]
 
     def _kv_used(self):
         return sum(len(s) for s in self.scheduler.running)  # before this step's new tokens are appended

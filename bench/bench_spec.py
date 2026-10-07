@@ -17,6 +17,7 @@ It also reports how repetitive the outputs are, which bounds what copying can ac
 Run from the repo root, e.g.:
     python -m bench.bench_spec --out results/e8a_off.json
     python -m bench.bench_spec --spec ngram --num-spec-tokens 4 --out results/e8a_ngram4.json
+    python -m bench.bench_spec --spec eagle --num-spec-tokens 4 --out results/e8b_eagle4.json
 """
 
 import argparse
@@ -79,6 +80,7 @@ def main():
     ap.add_argument("--workload", default="W4")
     ap.add_argument("--spec", default=None, help="drafting method, e.g. ngram; off by default")
     ap.add_argument("--num-spec-tokens", type=int, default=d.num_spec_tokens)
+    ap.add_argument("--draft-path", default=d.draft_path, help="the EAGLE draft model")
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 64])
     ap.add_argument("--requests-c1", type=int, default=32, help="requests run at concurrency 1")
     ap.add_argument("--temperature", type=float, default=None, help="overrides the workload's temperature")
@@ -93,14 +95,15 @@ def main():
     temperature = w["sampling"]["temperature"] if args.temperature is None else args.temperature
     cfg = EngineConfig(
         model=w.get("model", "gpt2"), max_model_len=1024, num_kv_blocks=args.num_kv_blocks,
-        max_num_seqs=max(args.concurrency), spec=args.spec, num_spec_tokens=args.num_spec_tokens,
+        max_num_seqs=max(args.concurrency), spec=args.spec, num_spec_tokens=args.num_spec_tokens, draft_path=args.draft_path,
         cuda_graph=not args.no_cuda_graph,
     )
     engine = LLMEngine(cfg)
     runner = engine.runner
     print(f"{cfg}\ntemperature {temperature}")
     if cfg.cuda_graph:
-        print(f"captured {len(runner.graphs)} decode graphs and {len(runner.mixed_graphs)} verify-step graphs in "
+        print(f"captured {len(runner.graphs)} decode, {len(runner.mixed_graphs)} verify-step and "
+              f"{len(runner.draft_graphs) + len(runner.chain_graphs)} drafting graphs in "
               f"{runner.graph_capture_s:.1f} s, {runner.graph_memory_bytes / 2**20:.0f} MiB")
     t = time.perf_counter()
     engine.warmup(temperature)

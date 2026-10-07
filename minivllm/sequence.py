@@ -31,6 +31,9 @@ class Sequence:
         self.num_cached_tokens = 0  # leading tokens whose K/V came from the prefix cache at admission
         self.num_computed_tokens = 0  # leading tokens whose K/V is in the pool
         self.block_hashes: list[int] = []  # prefix hashes of the full blocks, as far as computed
+        # EAGLE drafting: the tokens drafted for the next step, and the distributions they were sampled from
+        self.draft_tokens: list[int] = []
+        self.draft_probs = None
         self.arrival_time = arrival_time
         self.first_token_time = None
         self.token_times: list[float] = []  # when each completion token was produced

@@ -18,11 +18,13 @@ several chunks and mixed with decoding; mixed steps run in CUDA graphs too, so t
 them. A small pool preempts sequences in the middle of their prompts.
 
 Speculative decoding (n-gram drafts) runs on prompts that repeat a segment, so drafts are found; the check
-requires both accepted and rejected drafts. Verify steps run in CUDA graphs too.
+requires both accepted and rejected drafts. Verify steps run in CUDA graphs too. EAGLE drafting runs if its
+trained draft model (checkpoints/gpt2_eagle.pt) exists; its catch-up and draft chain are captured as well.
 
 Run from the repo root: python -m tests.test_engine
 """
 
+import os
 import random
 
 import torch
@@ -230,6 +232,28 @@ def main():
     engine = LLMEngine(EngineConfig(**{**cfg.__dict__, "spec": "ngram"}))
     rep_prompts, rep_params = repetitive_requests(24, 10000, 80, seed=5)
     ok &= run_case(engine, rep_prompts, rep_params, f"qwen3 {cfg.attention} {{'kv': 'paged', 'batching': 'continuous'}} spec ngram")
+    del engine
+    torch.cuda.empty_cache()
+
+    eagle_cfg = EngineConfig(**{**gcfg.__dict__, "spec": "eagle"})
+    if os.path.exists(eagle_cfg.draft_path):
+        engine = LLMEngine(eagle_cfg)
+        prompts, params = make_requests(24, 50257, 300, 80, seed=1)
+        for case in (CASES[2], CASES[4], CASES[1]):
+            engine.cfg = EngineConfig(**{**eagle_cfg.__dict__, **case})
+            engine.reset()
+            ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case} spec eagle")
+        engine.cfg = eagle_cfg
+        engine.reset()
+        sampled = [SamplingParams(temperature=0.8, top_p=0.95, max_tokens=p.max_tokens, ignore_eos=True) for p in params]
+        seqs = engine.generate(prompts, sampled)
+        sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
+        accepted = sum(r.num_accepted for r in engine.steps)
+        print(f"gpt2 spec eagle sampling (temperature 0.8, top_p 0.95): lengths {'ok' if sample_ok else 'WRONG'}, "
+              f"drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}")
+        ok &= sample_ok and accepted > 0
+    else:
+        print(f"spec eagle: skipped, no draft model at {eagle_cfg.draft_path}")
     print("PASS" if ok else "FAIL")
 
 

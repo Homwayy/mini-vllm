@@ -2,8 +2,9 @@
 
 Verification must leave the output distribution unchanged: with drafts [2, 5] on fixed target logits, the
 first output token must follow the target distribution of row 0, the second (given the first was 2) that of
-row 1, and the third (given 2, 5) that of row 2, over 200k samples. Greedy rows accept exactly the drafts
-that match the argmax.
+row 1, and the third (given 2, 5) that of row 2, over 200k samples. The same holds for drafts sampled from
+another distribution q (EAGLE's), given in the order of a draft vocabulary. Greedy rows accept exactly the
+drafts that match the argmax.
 
 Run from the repo root: python -m tests.test_spec
 """
@@ -78,6 +79,30 @@ def test_distribution():
     assert ok
 
 
+def test_distribution_sampled_drafts():
+    # drafts sampled from q, a different distribution over a reordered draft vocabulary (as EAGLE's)
+    torch.manual_seed(1)
+    base = torch.tensor([2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -3.0], device="cuda")
+    rows = torch.stack([base.roll(2), base.roll(5), base])
+    vocab = torch.tensor([7, 6, 5, 4, 3, 2, 1, 0], device="cuda")
+    q = torch.softmax(torch.stack([base.flip(0), base.roll(1).flip(0)]) * 0.5, -1)  # [2 positions, 8], over vocab
+    sampler = Sampler()
+    ok = True
+    for p in (SamplingParams(temperature=1.0), SamplingParams(temperature=0.7, top_p=0.9)):
+        d = vocab[torch.stack([torch.multinomial(q[0], N, replacement=True), torch.multinomial(q[1], N, replacement=True)], 1)]
+        drafts = d.tolist()
+        out = verify_drafts(sampler, rows.repeat(N, 1), [p] * N, drafts, q.repeat(N, 1), vocab)
+        errs = []
+        for depth in range(3):
+            sub = [o[depth] for o, dr in zip(out, drafts) if o[:depth] == dr[:depth]]
+            freq = torch.bincount(torch.tensor(sub), minlength=8).float() / len(sub)
+            err = (freq - expected(rows[depth].cpu(), p)).abs().max().item()
+            errs.append(err)
+            ok &= err < tolerance(len(sub))
+        print(f"sampled drafts, {p}: max |freq - exact| at positions 1-3: {', '.join(f'{e:.4f}' for e in errs)}")
+    assert ok
+
+
 def test_greedy_prefix():
     sampler = Sampler()
     base = torch.tensor([2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -3.0], device="cuda")
@@ -96,4 +121,5 @@ if __name__ == "__main__":
     test_ngram()
     test_greedy_prefix()
     test_distribution()
+    test_distribution_sampled_drafts()
     print("PASS")
