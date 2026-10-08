@@ -120,16 +120,21 @@ def _inverse_vocab(draft_vocab, n_cols):
 
 
 def verify_drafts(sampler: Sampler, logits, params: list[SamplingParams], drafts: list[list[int]],
-                  draft_probs=None, draft_vocab=None):
+                  draft_probs=None, draft_vocab=None, out=None):
     """Returns, per sequence, its accepted drafts followed by one token from the target model.
 
     logits [N, V] holds, for each sequence in order, the rows of its last token and of each of its drafts
     (len(drafts[i]) + 1 rows); the row of position j gives the distribution of the token after it.
     draft_probs [sum of len(drafts[i]), len(draft_vocab)]: the distribution each draft was sampled from,
     over the token ids draft_vocab; None for deterministic drafts.
+    out: an optional int64 GPU tensor with a row per sequence, which receives the number of accepted drafts
+    and the token after them, for work that continues on the GPU.
     """
     if any(p.temperature > 0 and (p.top_k > 0 or p.top_p < 1.0) for p in params):
-        return _verify_full(sampler, logits, params, drafts, draft_probs, draft_vocab)
+        result = _verify_full(sampler, logits, params, drafts, draft_probs, draft_vocab)
+        if out is not None:
+            out[: len(result)].copy_(torch.tensor([[len(r) - 1, r[-1]] for r in result]))
+        return result
     device = logits.device
     counts = np.array([len(d) + 1 for d in drafts], np.int64)
     assert counts.max() <= MAX_ROWS
@@ -151,7 +156,7 @@ def verify_drafts(sampler: Sampler, logits, params: list[SamplingParams], drafts
     lse = torch.empty(num_rows, dtype=torch.float32, device=device)
     amax = torch.empty(num_rows, dtype=torch.int32, device=device)
     accept = torch.empty(num_rows, dtype=torch.int8, device=device)
-    out = torch.empty(num_seqs, 2, dtype=torch.int64, device=device)
+    out = torch.empty(num_seqs, 2, dtype=torch.int64, device=device) if out is None else out[:num_seqs]
     q_stride = q.stride(0) if has_q else 0
     _accept_kernel[(num_rows,)](logits, logits.stride(0), n_cols, inv_t, nxt_t, drow_t, q, q_stride, inv_vocab,
                                 seeds[0], lse, amax, accept, HAS_Q=has_q, BLOCK=BLOCK, num_warps=NUM_WARPS)

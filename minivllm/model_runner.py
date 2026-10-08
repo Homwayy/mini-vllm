@@ -15,7 +15,8 @@ sequence computes its last token and its drafts, so a sequence without drafts ad
 
 With EAGLE drafting, after every step the draft model first catches up on the positions the target just
 verified (again a mixed step, over the draft's own KV pool), then drafts num_spec_tokens tokens per sequence
-in a chain of single-row steps; both are captured as CUDA graphs. After a prefill, the catch-up is the
+in a chain of single-row steps; both are captured as CUDA graphs. After a verify step, both take their
+inputs from the verify step's buffers and acceptance on the GPU. After a prefill, the catch-up is the
 draft's prefill over the prompt, with the target's prefill layout.
 """
 
@@ -36,7 +37,7 @@ from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
 from minivllm.sampler import Sampler
 from minivllm.sequence import Sequence
-from minivllm.spec.eagle import load_eagle
+from minivllm.spec.eagle import draft_inputs_kernel, load_eagle
 from minivllm.spec.rejection import verify_drafts
 
 MODELS = {
@@ -127,6 +128,7 @@ class ModelRunner:
         self.draft_graphs = {}  # token bucket -> (CUDAGraph, draft output) for catching up
         self.chain_graphs = {}  # batch bucket -> CUDAGraph that drafts num_spec_tokens tokens
         self.last = None  # the last forward, for drafting: (sequences, hidden states, first row of each, prefill meta and positions)
+        self.last_verify = None  # the token bucket of the last forward if it was a verify step
         if cfg.spec == "eagle":
             self.draft = load_eagle(cfg.draft_path, self.model, attn, device)
             a = self.draft.block.attn
@@ -142,6 +144,8 @@ class ModelRunner:
             self.ch_block_tables = torch.zeros(s, cdiv(cfg.max_model_len + g, cfg.block_size), dtype=torch.int32, device=device)
             self.ch_tokens = torch.zeros(s, g, dtype=torch.int64, device=device)
             self.ch_probs = torch.zeros(s, g, len(self.draft.vocab_ids), dtype=torch.float32, device=device)
+            self.ch_rows = torch.zeros(s, dtype=torch.int64, device=device)  # the catch-up row each chain row starts from
+            self.verify_out = torch.zeros(s, 2, dtype=torch.int64, device=device)  # per sequence: accepted drafts, next token
         self.use_cuda_graph = False
         self.graph_capture_s = 0.0
         self.graph_memory_bytes = 0
@@ -281,13 +285,15 @@ class ModelRunner:
         """EAGLE drafting after a step. entries is [(i, n)]: sequence i of the last forward continues, and its
         first n rows there are verified. Returns each sequence's num_spec_tokens drafts, and the distributions
         they were sampled from ([len(entries), num_spec_tokens, draft vocabulary]; None if all are greedy)."""
+        if self.last_verify is not None:
+            return self.draft_after_verify(entries)
         seqs, hidden, starts, meta, positions = self.last
         if meta is not None:  # after a prefill: the draft's prefill, over every prompt position
             cu = meta.cu_seqlens
             ids = itertools.chain.from_iterable(seq.token_ids[1 : 1 + b - a] for seq, a, b in zip(seqs, cu[:-1], cu[1:]))
             out = self.draft(hidden, self.to_device(list(ids), np.int64), positions, meta)
             last_rows = [starts[i] + n - 1 for i, n in entries]
-        else:  # after a decode or verify step: catch up on the verified positions
+        else:  # after a decode step without drafts: catch up on the verified positions
             rows = [starts[i] + j for i, n in entries for j in range(n)]
             padded = next(b for b in self.mixed_buckets if b >= len(rows))
             cu = self.fill_mixed_buffers(
@@ -310,6 +316,42 @@ class ModelRunner:
         drafts = self.ch_tokens[: len(chain)].tolist()
         probs = self.ch_probs[: len(chain)].clone() if any(seq.params.temperature > 0 for seq in chain) else None
         return drafts, probs
+
+    @torch.inference_mode()
+    def draft_after_verify(self, entries):
+        """draft_next after a verify step, with no input built on the CPU. The catch-up reuses the verify step's
+        buffers: each verified row gets the token after it, and the other rows write into the scratch block
+        (draft_inputs_kernel). The chain then starts from each sequence's last verified row and uses the
+        verify step's block tables, which have room for it (LLMEngine._step_spec). Both run for every
+        sequence of the verify step; only those in entries keep their drafts."""
+        seqs, hidden = self.last[0], self.last[1]
+        padded, n = self.last_verify, len(seqs)
+        chain_padded = next(b for b in self.buckets if b >= n)
+        temps = self.to_device([seq.params.temperature for seq in seqs], np.float32)
+        self.mix_feat[:padded].copy_(hidden[:padded])
+        draft_inputs_kernel[(chain_padded,)](
+            self.mix_ids, self.mix_pos, self.mix_slots, self.mix_cu, self.mix_block_tables, self.mix_block_tables.stride(0),
+            self.mix_block_tables.shape[1], self.verify_out, temps, n, self.scratch_block, self.cfg.block_size,
+            self.ch_rows, self.ch_pos, self.ch_temp, self.ch_block_tables, self.ch_block_tables.stride(0),
+            self.ch_block_tables.shape[1], MAX_ROWS=triton.next_power_of_2(self.cfg.num_spec_tokens + 1),
+            BT_BLOCK=triton.next_power_of_2(self.ch_block_tables.shape[1]))
+        if self.use_cuda_graph:
+            graph, g = self.draft_graphs[padded]
+            graph.replay()
+        else:
+            g = self.draft_hidden(padded)
+        torch.index_select(g, 0, self.ch_rows[:chain_padded], out=self.ch_g[:chain_padded])
+        if self.use_cuda_graph:
+            self.chain_graphs[chain_padded].replay()
+        else:
+            self.draft_chain(chain_padded)
+        rows = [i for i, _ in entries]
+        drafts = self.ch_tokens[:n].tolist()
+        probs = None
+        if any(seqs[i].params.temperature > 0 for i in rows):
+            # usually every sequence keeps drafting, and a copy needs no row indices
+            probs = self.ch_probs[:n].clone() if len(rows) == n else self.ch_probs[self.to_device(rows, np.int64)]
+        return [drafts[i] for i in rows], probs
 
     @torch.inference_mode()
     def capture_graphs(self):
@@ -377,7 +419,7 @@ class ModelRunner:
             input_ids, positions, meta, last = self.prepare_prefill(seqs)
             hidden = self.model(input_ids, positions, meta)
             if self.draft is not None:
-                self.last = (seqs, hidden, meta.cu_seqlens[:-1], meta, positions)
+                self.last, self.last_verify = (seqs, hidden, meta.cu_seqlens[:-1], meta, positions), None
             hidden = hidden[last]
         else:
             padded = next(b for b in self.buckets if b >= len(seqs))
@@ -389,7 +431,7 @@ class ModelRunner:
                 hidden = self.decode_hidden(padded, max_context_len)
             hidden = hidden[: len(seqs)]
             if self.draft is not None:
-                self.last = (seqs, hidden, list(range(len(seqs))), None, None)
+                self.last, self.last_verify = (seqs, hidden, list(range(len(seqs))), None, None), None
         logits = self.model.compute_logits(hidden)
         return self.sampler(logits, [seq.params for seq in seqs]).tolist()
 
@@ -421,15 +463,16 @@ class ModelRunner:
             return [[tok] for tok in self.run(seqs, is_prefill=False)]
         t = len(seqs) + sum(map(len, drafts))
         padded = next(b for b in self.mixed_buckets if b >= t)
-        cu = self.fill_mixed_buffers([(seq, len(seq) - 1, [seq.token_ids[-1]] + d) for seq, d in zip(seqs, drafts)], padded)
+        self.fill_mixed_buffers([(seq, len(seq) - 1, [seq.token_ids[-1]] + d) for seq, d in zip(seqs, drafts)], padded)
         hidden = self.mixed_forward(padded)
         if self.draft is not None:
-            self.last = (seqs, hidden, cu[:-1].tolist(), None, None)
+            self.last, self.last_verify = (seqs, hidden, None, None, None), padded
         logits = self.model.compute_logits(hidden[:t])
         q, vocab = None, None
         if draft_probs is not None:
             q, vocab = torch.cat([probs[: len(d)] for probs, d in zip(draft_probs, drafts) if d]), self.draft.vocab_ids
-        return verify_drafts(self.sampler, logits, [seq.params for seq in seqs], drafts, q, vocab)
+        return verify_drafts(self.sampler, logits, [seq.params for seq in seqs], drafts, q, vocab,
+                             out=self.verify_out if self.draft is not None else None)
 
     def mixed_forward(self, padded: int):
         if self.use_cuda_graph:

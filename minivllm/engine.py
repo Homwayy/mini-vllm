@@ -156,7 +156,7 @@ class LLMEngine:
                 d = seq.draft_tokens[:k]  # EAGLE: drafted at the end of this sequence's previous step
             while d and not self.kv.can_append(seq, len(d)):  # drafts only take blocks that are free
                 d.pop()
-            self.kv.append(seq, len(d))
+            self.kv.append(seq, len(d) + self._chain_room(seq, len(d)))
             drafts.append(d)
         probs = None
         if self.cfg.spec == "eagle" and any(seq.params.temperature > 0 for seq in seqs):
@@ -176,7 +176,7 @@ class LLMEngine:
                 seq.num_computed_tokens = len(seq) - 1
                 verified.append((i, seq, len(toks)))  # the rows of its last token and its accepted drafts
         if self.cfg.spec == "eagle":
-            self._draft(verified)
+            self._draft(verified, after_verify=True)
             record.end = time.perf_counter()
         else:
             for _, seq, _ in verified:
@@ -188,12 +188,25 @@ class LLMEngine:
         # never more tokens than max_tokens allows: the drafts plus one from the target model
         return min(self.cfg.num_spec_tokens, seq.params.max_tokens - seq.num_completion_tokens - 1)
 
-    def _draft(self, entries):
+    def _chain_room(self, seq, num_drafts):
+        """EAGLE drafts right after the verify step, with the blocks seq has in it (ModelRunner.draft_after_verify);
+        the chain writes up to num_spec_tokens - 1 positions past the drafts. Returns how many of those
+        positions to allocate now: all that max_len and the free blocks allow."""
+        if self.cfg.spec != "eagle":
+            return 0
+        extra = max(0, min(self.cfg.num_spec_tokens - 1, seq.max_len - len(seq) - num_drafts))
+        while extra and not self.kv.can_append(seq, num_drafts + extra):
+            extra -= 1
+        return extra
+
+    def _draft(self, entries, after_verify=False):
         """EAGLE: entries is [(row of the sequence in this step, sequence, number of its verified rows)]. Catches
         the draft model up on those rows and drafts the sequences' next tokens, with blocks reserved for them."""
         keep = []
         for i, seq, n in entries:
             k = self._max_drafts(seq)
+            if after_verify:  # draft m reads the chain's K/V up to position len(seq) + m - 3, in the step's blocks
+                k = min(k, len(seq.block_table) * self.cfg.block_size - len(seq) + 2)
             while k > 0 and not self.kv.can_append(seq, k):
                 k -= 1
             self.kv.truncate(seq, k)

@@ -9,11 +9,16 @@ drafting step does not read the whole 74 MB LM head. Each further draft token fe
 
 The draft's KV cache has the target's layout and uses the target's block tables: draft position t sits in
 the same slot as target position t, in one more pool.
+
+After a verify step, the inputs of the draft's catch-up and of its drafting chain are built on the GPU from
+the verify step's buffers and its acceptance (draft_inputs_kernel), so no buffer is filled on the CPU.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 from minivllm.attention import AttnMetadata
 from minivllm.models.gpt2 import GPT2Block, GPT2Config, apply_rope
@@ -92,6 +97,39 @@ def chain_mask(j, T, device):
     s = torch.arange(T, device=device)[:, None]
     t = torch.arange(T, device=device)[None, :]
     return torch.cat([t <= s - j] + [t == s - (j - m) for m in range(1, j + 1)], 1)
+
+
+@triton.jit(do_not_specialize=["num_seqs"])
+def draft_inputs_kernel(ids_ptr, pos_ptr, slots_ptr, cu_ptr, bt_ptr, bt_stride, bt_width, accepted_ptr, temp_ptr,
+                        num_seqs, scratch_block, block_size, rows_ptr, ch_pos_ptr, ch_temp_ptr, ch_bt_ptr, ch_bt_stride,
+                        ch_bt_width, MAX_ROWS: tl.constexpr, BT_BLOCK: tl.constexpr):
+    """One program per row of the drafting chain. For sequence i of the verify step (rows start .. start +
+    count - 1, of which the first a + 1 are verified): the catch-up gives verified row j the token after it
+    (the next row's token, or the target's token at row a) and sends the other rows' K/V to the scratch
+    block; the chain starts from the catch-up's row a, one position further, with the verify step's block
+    table. Rows past the sequences are padding: position 0, greedy, scratch block."""
+    i = tl.program_id(0)
+    cols = tl.arange(0, BT_BLOCK)
+    if i < num_seqs:
+        start = tl.load(cu_ptr + i).to(tl.int64)
+        count = tl.load(cu_ptr + i + 1) - tl.load(cu_ptr + i)
+        a = tl.load(accepted_ptr + 2 * i)  # accepted drafts
+        tok = tl.load(accepted_ptr + 2 * i + 1)  # the target's token after them
+        j = tl.arange(0, MAX_ROWS)
+        nxt = tl.load(ids_ptr + start + j + 1, mask=j < a, other=0)
+        tl.store(ids_ptr + start + j, tl.where(j < a, nxt, tok), mask=j <= a)
+        tl.store(slots_ptr + start + j, scratch_block * block_size, mask=(j > a) & (j < count))
+        row = start + a
+        tl.store(rows_ptr + i, row)
+        tl.store(ch_pos_ptr + i, tl.load(pos_ptr + row) + 1)
+        tl.store(ch_temp_ptr + i, tl.load(temp_ptr + i))
+        bt = tl.load(bt_ptr + i * bt_stride + cols, mask=cols < bt_width, other=scratch_block)
+        tl.store(ch_bt_ptr + i * ch_bt_stride + cols, bt, mask=cols < ch_bt_width)
+    else:
+        tl.store(rows_ptr + i, 0)
+        tl.store(ch_pos_ptr + i, 0)
+        tl.store(ch_temp_ptr + i, 0.0)
+        tl.store(ch_bt_ptr + i * ch_bt_stride + cols, scratch_block, mask=cols < ch_bt_width)
 
 
 def load_eagle(path, target, attn_backend, device="cuda", dtype=torch.bfloat16):
