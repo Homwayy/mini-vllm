@@ -244,16 +244,19 @@ def main():
             engine.reset()
             ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case} spec eagle")
         engine.cfg = eagle_cfg
-        engine.reset()
-        sampled = [SamplingParams(temperature=0.8, top_p=0.95, max_tokens=p.max_tokens, ignore_eos=True) for p in params]
-        seqs = engine.generate(prompts, sampled)
-        sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
-        accepted = sum(r.num_accepted for r in engine.steps)
-        dropped = all(s.draft_probs is None for s in seqs)  # finished sequences keep no draft distributions
-        print(f"gpt2 spec eagle sampling (temperature 0.8, top_p 0.95): lengths {'ok' if sample_ok else 'WRONG'}, "
-              f"drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}, "
-              f"draft distributions {'dropped' if dropped else 'KEPT'}")
-        ok &= sample_ok and accepted > 0 and dropped
+        # top-p takes the full acceptance path, plain temperature the fused kernels
+        for sp in (SamplingParams(temperature=0.8, top_p=0.95), SamplingParams(temperature=1.0)):
+            engine.reset()
+            sampled = [SamplingParams(temperature=sp.temperature, top_p=sp.top_p, max_tokens=p.max_tokens, ignore_eos=True)
+                       for p in params]
+            seqs = engine.generate(prompts, sampled)
+            sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
+            accepted = sum(r.num_accepted for r in engine.steps)
+            dropped = all(s.draft_probs is None for s in seqs)  # finished sequences keep no draft distributions
+            print(f"gpt2 spec eagle sampling (temperature {sp.temperature}, top_p {sp.top_p}): lengths "
+                  f"{'ok' if sample_ok else 'WRONG'}, drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}, "
+                  f"draft distributions {'dropped' if dropped else 'KEPT'}")
+            ok &= sample_ok and accepted > 0 and dropped
     else:
         print(f"spec eagle: skipped, no draft model at {eagle_cfg.draft_path}")
     print("PASS" if ok else "FAIL")
