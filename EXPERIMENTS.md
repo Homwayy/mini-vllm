@@ -2,7 +2,7 @@
 
 从零写一个小型 LLM 推理引擎（mini vLLM），在一张 12 GB 的笔记本 GPU 上服务 Qwen3-0.6B，逐项对比 KV cache 的管理方式、调度策略和注意力实现对吞吐和延迟的影响。
 
-目前完成了 E0（正确性）到 E7，E8a、E8b、E8b.1、E8b.2，以及 E9。在固定的离线负载 W1（256 条请求）上：
+目前完成了 E0（正确性）到 E7，E8a、E8b、E8b.1、E8b.2，以及 E9、E10。在固定的离线负载 W1（256 条请求）上：
 
 - **E1（基线）：** 静态批处理的起点是 1760 输出 token/s，是 HF transformers 静态批处理（160 token/s）的 11.0 倍；但 KV 池里平均只有 26.2% 的槽位存着 token。
 - **E2（分页 KV）：** KV 改成分页以后，KV 利用率从 52% 提高到 99%，同一批能放的序列从 32 条提高到最多 60 条，吞吐提高 24.9%，到 2204 token/s。提升受限于静态批处理的尾部：每批都要等其中最长的请求。
@@ -52,6 +52,7 @@
 - **E9 在 W4 上：** 不投机快 31–39%，EAGLE 快 28–33%。
   - W4 的 prefill 步大多只有一条短 prompt，不录图，时间主要花在 CPU 提交 kernel 上；kernel 少了以后，每步快了约一倍。并发 32、64 时，省下的总时间有 44–63% 在 prefill。
   - 不投机变快得更多，EAGLE 相对不投机的收益略降到 +23–60%（每个并发取最好的 γ）。
+- **E10（短 prefill 步也录 CUDA graph）：** 不分块时，512 个 token 以内的 prefill 步也补齐到 token 桶、录成图。W4 的 prefill 步快了 21–36%，并发 8–64 时吞吐提高 3.4–6.2%，ITL 的 p99 降低 15–31%；W1 不变。
 
 详见第 2 节。
 
@@ -104,13 +105,14 @@
   - `chunked_prefill=True`：分块 prefill，每步最多算 `max_num_batched_tokens` 个 token，prompt 可以分几步算完，和 decode 放在同一步里（见 E7、3.8）。只能和 `kv=paged`、`attention=triton`、`batching=continuous` 一起用。
   - `spec="ngram"` 或 `spec="eagle"`：投机解码，每个 decode 步里每条序列最多验证 `num_spec_tokens` 个草稿 token。ngram 从前文照抄草稿（见 E8a、3.9）；eagle 用训练出来的草稿模型起草，只用于 GPT-2（见 E8b、3.10）。只能和 `attention=triton` 一起用，暂不和前缀缓存、分块 prefill 一起用。
   - `fused_kernels=True`（默认）：每层逐元素的部分用 [minivllm/fused.py](minivllm/fused.py) 里融合的 Triton kernel（见 E9、3.11）。E1–E8 用的都是 `False` 时的写法，那时还没有这些 kernel。
+  - `prefill_graph_tokens=512`（默认）：不分块、`attention=triton` 时，不超过这么多个 token 的 prefill 步也补齐到 token 桶、录 CUDA graph（见 E10、3.12）。设成 0 时，不分块的 prefill 都不录图，E1–E9 都是这样。
 - **其他固定设置：** 不分块时，每一步要么全是 prefill，要么全是 decode，prefill 每步最多 16,384 个 token；最多同时运行 256 条序列；max_model_len 2048。
 - **注意力：** 三种实现，用 `attention` 切换：
   - `attention=flex`：FlexAttention。prefill 一次处理打平的多条序列（document mask），decode 按 block table 直接读 KV 池，见 3.1。E1–E3 用它。
   - `attention=triton`：prefill 和 decode 都用自己写的 Triton 分页注意力（见 3.5）。prefill 的 K/V 也全部从池里读，所以能接在已经缓存的前缀后面。
   - `attention=triton-decode`：decode 用 Triton，prefill 用 FlexAttention，是 E4 测的配置（E4 时它叫 `triton`）。
   - `attention=gather`：把每条序列的 KV 从池里拷出来、补齐，再调用 SDPA，只作为正确性和性能的参照。
-- **CUDA graph：** decode 按 batch 大小分桶（1、2、4、8，再从 16 到 256 每隔 16 一个，共 20 个）录图，batch 补齐到桶的大小，见 3.2。分块时，同时有 prompt 和 decode 的步按 token 数分桶，也录图（见 3.8）；投机解码的验证步也这样录图（见 3.9），EAGLE 的补算和起草链也录图（见 3.10）；不分块时 prefill 不录图。
+- **CUDA graph：** decode 按 batch 大小分桶（1、2、4、8，再从 16 到 256 每隔 16 一个，共 20 个）录图，batch 补齐到桶的大小，见 3.2。分块时，同时有 prompt 和 decode 的步按 token 数分桶，也录图（见 3.8）；投机解码的验证步也这样录图（见 3.9），EAGLE 的补算和起草链也录图（见 3.10）。不分块时，E10 起不超过 512 个 token 的 prefill 步也录图（见 3.12），更长的不录图。
 - **采样：** 每条请求可以有自己的 temperature、top-k 和 top-p。
 - **和最初计划的不同：** 计划里 FlexAttention 和 CUDA graph 分别是 E4、E5 的内容。但不录图时，decode 每一步的耗时几乎不随 batch 大小变化（见 3.4），会把批处理带来的收益放大。所以 E1–E3 都在开着这两项的引擎上测；E4、E5 改成在最终引擎上的消融实验：换掉注意力实现，或者关掉 CUDA graph。
 
@@ -166,7 +168,8 @@
 | E5 | 2026-10-07 | `b7c38b4` | E4b 的配置，`cuda_graph=False`（decode 不录图） | 1484 token/s（对照组 2656、2682） | 43.9 / 60 | 0.992 | 0.614 | 8.62 GiB |
 | E6 | 2026-10-07 | `995c15c` | E4b 的配置，`prefix_caching=True`；W1 上没有可共享的前缀，W3 见 E6 | 2708 token/s（对照组 2711、2712） | 46.7 / 60 | 0.992 | 0.652 | 8.63 GiB |
 | E7 | 2026-10-07 | `32ff87b` | E4b 的配置，`chunked_prefill=True`，每步最多 1024 个 token；W2 见 E7 | 2712 token/s（对照组 2711、2645） | 46.5 / 60 | 0.992 | 0.649 | 8.28 GiB |
-| E9 | 2026-10-08 | `3b6e574` | E4b 的配置，`fused_kernels=True`（融合逐元素的 kernel） | **3200 token/s**（对照组 2703、2712） | 47.1 / 60 | 0.992 | 0.658 | 8.59 GiB |
+| E9 | 2026-10-08 | `3b6e574` | E4b 的配置，`fused_kernels=True`（融合逐元素的 kernel） | 3200 token/s（对照组 2703、2712） | 47.1 / 60 | 0.992 | 0.658 | 8.59 GiB |
+| E10 | 2026-10-08 | `9e1b0b2` | E9 的配置，`prefill_graph_tokens=512`（短 prefill 步录图） | **3215 token/s**（对照组 3208、3212） | 47.1 / 60 | 0.992 | 0.659 | 8.60 GiB |
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
@@ -1291,6 +1294,69 @@
 
 **结论：** 把每层逐元素的部分合成 5 个 Triton kernel 以后，decode 图里的 kernel 从 1525 个降到 282 个（Qwen3），每步省 1.5–2.1 ms；不录图的 prefill 也快了 36%（W1）到约一倍（W4），前者省的是读写激活的带宽，后者省的是 CPU 提交 kernel 的时间。W1 的吞吐提高 18.2%，到 3200 token/s；W4 上不投机快 31–39%，EAGLE 快 28–33%，相对不投机仍有 +23–60%。GPT-2 上还能降的固定开销是起草链里每次起草的采样、不录图的 prefill（融合后并发 64 时仍占总时间的 17–22%），以及并发 32 时验证步的补齐。
 
+### E10：短 prefill 步也录 CUDA graph（GPT-2、Qwen3）
+
+- **动机：** E9 之后，W4 的 prefill 步每步 4.0–6.5 ms，并发 32、64 时占总时间的 15–22%（不投机 14.9%、16.9%，EAGLE 20.6%、22.3%）。
+  - W4 不分块，prefill 不录图。每个 prefill 步大多只有一条 64–512 个 token 的 prompt，时间主要花在 CPU 一个个提交 kernel 上（3.11）。单独检查（3.12）：GPU 只算 0.8–3.9 ms，墙钟是 3.2–8.7 ms。
+  - 分块 prefill 的混合步早就录了图（E7、3.8），不分块时的 prefill 步可以用同一套布局。
+- **改动：** 在 [minivllm/model_runner.py](minivllm/model_runner.py) 里，设计见 3.12：
+  - 不分块、`attention=triton` 时，不超过 `prefill_graph_tokens`（默认 512）个 token 的 prefill 步放进混合步的静态缓冲区，补齐到 16、32，之后每 64 个 token 一个桶，每个桶录一个图。更长的 prefill 步照旧 eager、不补齐。
+  - EAGLE 的草稿模型在 prompt 上的 prefill 复用同一组缓冲区，只把每一行的 token 换成它后面那个，也按桶录图。
+  - 开关是 `EngineConfig.prefill_graph_tokens`，设成 0 就是原来的路径。
+- **正确性：**
+  - [tests/test_engine.py](tests/test_engine.py) 全部通过。用不用补齐的布局只由这个开关决定，不录图时也用，所以"录图和不录图生成的 token 逐个相同"这项检查也覆盖了新路径。
+  - 单独检查（W4 的前 96 条请求，并发 8，EAGLE γ = 4）：85 个 prefill 步里有 82 个回放了图。贪心时 96 条序列和全部 eager 时逐个相同，接受的草稿数也相同（21,819 个）。草稿模型在 prompt 上的 K/V 只由这一次 prefill 写入，写错的话，之后每一步的起草都会受影响。
+- **测法：** 同 E9，同一份代码，对照组加 `--prefill-graph-tokens 0`：
+  - W4，temperature 1.0（[bench/bench_spec.py](bench/bench_spec.py)）：不投机和 EAGLE γ = 4 都按"关、开、关"跑；γ = 3 只在打开时跑一次。
+  - W1（[bench/bench_offline.py](bench/bench_offline.py)）：也按"关、开、关"。
+- **运行条件：** 2026-10-08，代码版本 `9e1b0b2`。在同一次测试里先跑 W4（不投机和 γ = 4 的对照在首尾），再跑 W1。前后两次对照组的吞吐相差 −1.2% 到 +2.1%，W1 是 +0.14%。
+
+**W4，temperature 1.0：输出吞吐**（token/s；括号里是相对同一配置两次对照平均的变化）：
+
+| 并发 | 不投机：关（前 / 后） | 不投机：开 | EAGLE γ = 4：关（前 / 后） | EAGLE γ = 4：开 | EAGLE γ = 3：开 |
+|---|---|---|---|---|---|
+| 1 | 864 / 879 | 881（+1.1%） | 1389 / 1392 | **1382（−0.6%）** | 1364 |
+| 8 | 5339 / 5451 | 5578（+3.4%） | 7597 / 7585 | 7855（+3.5%） | **8018** |
+| 32 | 11941 / 12035 | 12449（+3.8%） | 13565 / 13596 | 14425（+6.2%） | **16049** |
+| 64 | 15247 / 15172 | 15960（+4.9%） | 18718 / 18502 | **19693（+5.8%）** | 19419 |
+
+- **相对不投机（都打开）：** γ = 4 是 +56.8%、+40.8%、+15.9%、+23.4%（并发 1、8、32、64），γ = 3 是 +54.7%、+43.8%、+28.9%、+21.7%。
+- **每步的 token 数和接受率不变：** γ = 4 关的时候每步 2.76–2.80 个 token、接受率 0.444–0.453，开的时候是 2.76–2.77 个、0.444–0.447。
+
+**W4 的 prefill 步、decode 和 ITL**（每个并发取 3 次里吞吐居中的那次；每格是"关（前后两次的平均）→ 开"）：
+
+| 并发 | prefill 每步：不投机 | prefill 每步：EAGLE γ = 4 | prefill 占总时间：不投机 / EAGLE | decode 总时间的变化：不投机 / EAGLE | ITL p99：不投机 | ITL p99：EAGLE γ = 4 |
+|---|---|---|---|---|---|---|
+| 1 | 4.00 → 2.56 ms | 5.30 → 3.58 ms | 1.0% → 0.7% / 2.2% → 1.4% | −0.7% / +1.4% | 1.58 → 1.58 ms | 2.47 → 2.49 ms |
+| 8 | 3.95 → 2.59 ms | 5.30 → 3.68 ms | 7.0% → 4.8% / 12.9% → 9.1% | −0.9% / +0.8% | 4.82 → 3.94 ms | 7.19 → 6.11 ms |
+| 32 | 4.28 → 2.92 ms | 5.65 → 4.16 ms | 14.6% → 10.4% / 20.3% → 15.4% | +1.1% / 0.0% | 8.64 → 5.95 ms | 13.25 → 10.48 ms |
+| 64 | 4.45 → 3.19 ms | 6.09 → 4.81 ms | 16.0% → 12.0% / 22.9% → 18.2% | −0.1% / +0.3% | 10.10 → 7.71 ms | 15.61 → 13.21 ms |
+
+- **prefill 每步：** prefill 的总时间除以 prefill 的步数。EAGLE 的 prefill 步还包括草稿模型在 prompt 上的 prefill 和第一次起草。
+
+**W1**（3 次的中位数）：
+
+| | 关（前 / 后） | 开 | 变化 |
+|---|---|---|---|
+| 输出吞吐 | 3208 / 3212 token/s | 3215 token/s | +0.16% |
+| prefill 每步 | 24.46 / 24.42 ms | 24.25 ms | −0.8% |
+| decode 步 | 12.38 / 12.36 ms | 12.36 ms | −0.1% |
+| 录图的时间 | 0.84 / 0.84 s | 1.12 s | |
+
+结果：
+
+- **W4 的 prefill 步快了 21–36%，并发 8–64 时吞吐提高 3.4–6.2%：**
+  - 不投机的 prefill 步从 3.9–4.5 ms 降到 2.6–3.2 ms，EAGLE 从 5.3–6.1 ms 降到 3.6–4.8 ms。decode 的总时间不变（−0.9% 到 +1.4%），省下的几乎都是 prefill 的时间。
+  - EAGLE 的 prefill 步多一次草稿模型的 prefill，每步省 1.3–1.7 ms，不投机省 1.3–1.4 ms。
+  - 收益跟着 prefill 占的比例走。并发 1 时 prefill 只占总时间的 1–2%，吞吐的变化（+1.1%、−0.6%）在运行之间的波动以内；并发 32、64 时占 15–23%，吞吐提高 3.8–6.2%。
+- **ITL 的 p99 降低 15–31%（并发 8–64），TPOT 的中位数降低 3–7%：** 不分块时，prefill 步会让正在 decode 的序列多等一步，p99 的间隔大约是一个 decode 步加一个 prefill 步（不投机、并发 8：1.33 + 2.59 ms，ITL 的 p99 是 3.94 ms）。prefill 步变短，这个间隔也跟着变短。
+- **录图以后，prefill 步仍比 GPU 的时间长：** 单独检查（3.12），一条 256 个 token 的 prompt，不投机时墙钟 2.54 ms、GPU 1.94 ms，EAGLE 时 4.19 ms、2.57 ms。剩下的是采样结果拷回 CPU 的同步；EAGLE 还多一次起草结果的拷回，以及两次之间 CPU 准备草稿输入的时间。这些录图省不掉。
+- **W1 不变（+0.16%，两次对照之间差 0.14%）：** W1 的 prefill 步平均约 910 个 token（147,986 个 prompt token、162 步），Qwen3 的 prefill 主要卡在 GPU 上。不超过 512 个 token 的那些步，录图也只在 128 个 token 以内明显更快（3.12）。
+- **代价：** 每个桶多录一个图，录图的时间多 0.06–0.28 秒（W4 不投机 0.45、0.39 → 0.51 秒，EAGLE 0.71、0.64 → 0.78 秒，W1 0.84 → 1.12 秒）。显存峰值 W4 最多多 15 MiB，W1 多 5 MiB。
+- **EAGLE 相对不投机的收益基本不变：** 每个并发取最好的 γ，从 E9 的 +60%、+45%、+26%、+23% 变成 +57%、+44%、+29%、+23%：两边的 prefill 都变快了。
+
+**结论：** 不分块时，把 512 个 token 以内的 prefill 步也录成 CUDA graph，W4 的 prefill 步快了 21–36%，并发 8–64 时吞吐提高 3.4–6.2%，ITL 的 p99 降低 15–31%；W1 不变。收益有两个上限：prefill 只占总时间的一小部分（并发 64 时也只有 16–23%）；录图以后，prefill 步里仍剩下拷回 CPU 的同步，每步还要 2.6–4.8 ms。
+
 ## 3. 工程记录与设计决策
 
 ### 3.1 用 FlexAttention 做分页注意力
@@ -1540,6 +1606,34 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
   - 查过不是降频：四个并发连着跑、每 200 ms 记一次，SM 频率基本稳定在 2745–2782 MHz。后半段功耗到了 130–138 W（融合时更高），离 140 W 的上限很近；只跑并发 64 时，驱动的功耗限速和温度限速计数在运行前后都没有增加。
   - 并发 64 的结果在不同运行之间变化也大：另外三组单独检查里，并发 64 时 EAGLE 的 decode 步省 0.22–0.75 ms，正式测试是 0.40 ms。
 
+### 3.12 短 prefill 步录图
+
+代码在 [minivllm/model_runner.py](minivllm/model_runner.py) 的 `run`、`draft_next` 和 `capture_graphs`：
+
+- **复用混合步的布局：** 每条序列占一个槽位，补出来的 token 组成最后一条"假序列"，只读写池外面的那个块（同 3.8）。prefill kernel 的 grid 只取决于 token 总数和槽位数，所以每个桶可以录一个图。
+- **桶：** 16、32，之后每 64 个 token 一个，到上限 512 为止，共 10 个。比 2 的幂细，因为补出来的 token 要多花 GPU 时间，而录图省下的是每一步固定的 CPU 时间。
+- **tile 和 eager 的 prefill 一样：** 每个桶按它的大小取 tile 的行数（`prefill_block_m`），128 个 token 以上的桶都是 128 行。分块 prefill 的混合步里有 decode 行，所以用 32 行（3.8）；prefill 步里没有 decode 行。
+- **不录图时也补齐：** 用哪种布局只由 `prefill_graph_tokens` 决定，和 `cuda_graph` 无关。这样录图和不录图跑的是同样形状上的同样 kernel，test_engine 的逐 token 比较仍然成立。
+- **EAGLE 草稿的 prefill 复用目标模型的缓冲区：** 位置、槽位、block table 都相同，只把每一行的 token 换成它后面那个（最后一行是这一步刚采样出的 token），特征直接取目标模型这一步的输出。
+- **上限取 512 的依据**（单独检查：一个 prefill 步，一条 prompt，经过 engine.step()。墙钟是 20 次的中位数；GPU 时间是 profiler 统计的 kernel 时间，包括 logits、采样，EAGLE 还包括起草链。"关"测了前后两次）：
+
+| prompt 的 token 数 | 64 | 128 | 256 | 384 | 512 |
+|---|---|---|---|---|---|
+| GPT-2：关，墙钟（两次） / GPU | 3.21、3.74 / 0.80 ms | 3.52、6.06 / 1.18–1.33 ms | 6.62、4.09 / 1.83–1.84 ms | 3.94、4.39 / 2.06–2.07 ms | 3.87、3.99 / 3.01–3.03 ms |
+| GPT-2：开，墙钟 / GPU | 1.24 / 0.83 ms | 2.20 / 1.23 ms | 2.54 / 1.94 ms | 2.82 / 2.16 ms | 3.93 / 3.04 ms |
+| GPT-2 + EAGLE：关 | 4.92、4.41 / 1.27–1.28 ms | 5.61、5.01 / 1.70 ms | 4.71、8.73 / 2.43–2.45 ms | 5.16、8.12 / 2.74 ms | 5.52、5.59 / 3.73–3.89 ms |
+| GPT-2 + EAGLE：开 | 1.95 / 1.34 ms | 3.41 / 1.78 ms | 4.19 / 2.57 ms | 4.65 / 2.80 ms | 4.82 / 4.11 ms |
+| Qwen3：关 | 8.54、6.72 / 3.45 ms | 7.62、7.17 / 4.75–4.88 ms | 8.74、9.06 / 7.22–8.06 ms | 12.93、13.28 / 11.97–12.15 ms | 13.50、13.50 / 12.35–12.70 ms |
+| Qwen3：开 | 4.44 / 4.19 ms | 5.96 / 5.48 ms | 8.47 / 7.84 ms | 12.88 / 12.04 ms | 13.22 / 12.61 ms |
+
+  - **GPT-2 关的时候卡在 CPU 上：** 墙钟 3.2–8.7 ms，GPU 只算 0.8–3.9 ms。墙钟还随 CPU 的状态变化很大，同一个点两次能差将近一倍。录图以后，512 个 token 以内都不比关的时候慢。更早的一轮扫描里，768 个 token 时补齐的代价超过了省下的（GPT-2 + EAGLE：开 6.25 ms，关 5.92、5.86 ms），所以上限取 512。
+  - **Qwen3 的 prefill 主要卡在 GPU 上：** 256 个 token 以上，开和关差不多；只有 128 个 token 以内明显更快。
+  - **录图以后，墙钟仍比 GPU 时间多 0.4–1.9 ms**（GPT-2 不投机 0.4–1.0 ms，EAGLE 0.6–1.9 ms）。这是采样结果拷回 CPU 的同步、EAGLE 起草结果的拷回，以及两次之间 CPU 准备草稿输入的时间，录图省不掉。
+- **空槽位的程序也有开销**（单独检查：Qwen3，一条 64 个 token 的 prompt，用 profiler 统计 28 层的 prefill kernel）：
+  - prefill kernel 的 grid 里，每个槽位都多一个程序（再乘以 KV 头数）。空槽位的程序先在 cu_seqlens 上二分查找自己属于哪条序列，发现没有 token 就退出。
+  - W1 的配置有 257 个槽位：28 层的 prefill kernel 一共 0.72 ms，eager 时（只有 1 条序列）是 0.22 ms；槽位改成 65 个时是 0.34 ms。所以 Qwen3 录图以后 GPU 时间多了约 0.5 ms，短 prefill 的收益比 GPT-2 小。
+  - 按桶的大小限制槽位数（不超过桶里的 token 数加 1）可以省掉这部分，还没有做。验证步和分块 prefill 的混合步也有同样的开销。
+
 ## 4. 实验列表
 
 | 编号 | 改动 | 对照 | 负载 | 状态 |
@@ -1562,3 +1656,4 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 | E8c | DSpark 式并行起草 + Markov head | E8b | W4 | 待做 |
 | E8d | 置信度调度：按预测的接受概率和并发选验证长度 | 固定验证长度 | W4，并发 1–64 | 待做 |
 | E9 | 融合逐元素的 kernel（`fused_kernels=True`）：每层的 norm、RoPE、写 KV、残差相加和 SiLU × up 合成 5 个 Triton kernel | 原来的写法（`--no-fused-kernels`），同一份代码 | 图里的 kernel；单步 decode；W1；W4，temperature 1.0，并发 1、8、32、64；拆解 | 已完成：decode 图的 kernel 从 1525 个降到 282 个（Qwen3），每步省 1.5–2.1 ms；W1 吞吐提高 18.2%，prefill 步快 36%；W4 上不投机快 31–39%、EAGLE 快 28–33%，不录图的 prefill 步快约一倍，见第 2 节 |
+| E10 | 不分块时，512 个 token 以内的 prefill 步补齐到 token 桶、录 CUDA graph（`prefill_graph_tokens=512`）；EAGLE 草稿的 prefill 也录图 | prefill 都不录图（`--prefill-graph-tokens 0`），同一份代码 | W4，temperature 1.0，并发 1、8、32、64；W1 | 已完成：W4 的 prefill 步快 21–36%，并发 8–64 时吞吐提高 3.4–6.2%，ITL 的 p99 降低 15–31%；W1 不变（+0.16%），见第 2 节 |
