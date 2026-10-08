@@ -33,6 +33,7 @@ class EagleDraft(nn.Module):
         self.block = GPT2Block(cfg, attn_backend)
         self.register_buffer("vocab_ids", torch.as_tensor(vocab_ids, dtype=torch.long))
         self.target = ()  # (wte, cos, sin, LM head rows of vocab_ids), shared with the target and frozen
+        self.fused = False  # run the block with the fused kernels of minivllm/fused.py
 
     def attach(self, target):
         rows = target.lm_head_weight[self.vocab_ids.to(target.lm_head_weight.device)]
@@ -54,6 +55,8 @@ class EagleDraft(nn.Module):
         wte, cos, sin, _ = self.target
         x = torch.cat([wte(tokens), features], dim=-1)
         x = self.fc(x.to(self.fc.weight.dtype)).float()
+        if self.fused:
+            return self.block.forward_fused(x, positions, cos, sin, meta)
         return self.block(x, cos[positions].unsqueeze(1), sin[positions].unsqueeze(1), meta)
 
     def logits(self, g):

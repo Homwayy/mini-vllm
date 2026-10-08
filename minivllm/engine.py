@@ -25,6 +25,7 @@ class EngineConfig:
     # mix prompt chunks with decoding in steps of at most max_num_batched_tokens (paged, triton, continuous)
     chunked_prefill: bool = False
     cuda_graph: bool = True  # capture the decode step per batch-size bucket
+    fused_kernels: bool = True  # each layer's elementwise parts in fused Triton kernels (minivllm/fused.py)
     # speculative decoding: up to num_spec_tokens draft tokens per sequence and decode step, which the target
     # model checks all in that step (attention="triton", without prefix caching or chunked prefill). "ngram"
     # copies them from earlier in the sequence; "eagle" drafts with the model in draft_path (gpt2 only).

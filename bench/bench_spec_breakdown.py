@@ -186,6 +186,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=None, help="overrides the workload's temperature")
     ap.add_argument("--detail", action="store_true", help="also run each level with synchronized sub-parts")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-fused-kernels", action="store_true", help="run each layer's elementwise ops one PyTorch kernel at a time")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -193,7 +194,7 @@ def main():
     temperature = w["sampling"]["temperature"] if args.temperature is None else args.temperature
     cfg = EngineConfig(
         model=w.get("model", "gpt2"), max_model_len=1024, max_num_seqs=max(args.concurrency), spec=args.spec,
-        num_spec_tokens=args.num_spec_tokens, draft_path=args.draft_path,
+        num_spec_tokens=args.num_spec_tokens, draft_path=args.draft_path, fused_kernels=not args.no_fused_kernels,
     )
     engine = LLMEngine(cfg)
     engine.warmup(temperature)

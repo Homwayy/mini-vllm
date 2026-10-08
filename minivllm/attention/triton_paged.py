@@ -314,6 +314,7 @@ class TritonAttention:
 
     def __init__(self, block_size, max_num_batched_tokens, max_num_seqs, device, flex_prefill=False):
         self.flex = FlexAttention(block_size, max_num_batched_tokens, max_num_seqs, device) if flex_prefill else None
+        self.reads_new_kv = flex_prefill  # the Triton kernels read this step's k and v from the pool
         self.prefill = PagedPrefill()
         self.decode = PagedDecode()
 

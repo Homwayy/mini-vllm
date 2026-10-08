@@ -22,6 +22,8 @@ SPARSE_BLOCK = 128  # block size of the prefill mask, and the query block size f
 
 
 class FlexAttention:
+    reads_new_kv = True  # prefill attends over this step's k and v as tensors
+
     def __init__(self, block_size, max_num_batched_tokens, max_num_seqs, device):
         self.block_size = block_size
         self.decode_masks = {}  # (batch size, block table width) -> (BlockMask, its index tensors)

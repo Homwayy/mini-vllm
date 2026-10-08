@@ -86,6 +86,7 @@ def main():
     ap.add_argument("--temperature", type=float, default=None, help="overrides the workload's temperature")
     ap.add_argument("--num-kv-blocks", type=int, default=d.num_kv_blocks)
     ap.add_argument("--no-cuda-graph", action="store_true")
+    ap.add_argument("--no-fused-kernels", action="store_true", help="run each layer's elementwise ops one PyTorch kernel at a time")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", required=True)
@@ -96,7 +97,7 @@ def main():
     cfg = EngineConfig(
         model=w.get("model", "gpt2"), max_model_len=1024, num_kv_blocks=args.num_kv_blocks,
         max_num_seqs=max(args.concurrency), spec=args.spec, num_spec_tokens=args.num_spec_tokens, draft_path=args.draft_path,
-        cuda_graph=not args.no_cuda_graph,
+        cuda_graph=not args.no_cuda_graph, fused_kernels=not args.no_fused_kernels,
     )
     engine = LLMEngine(cfg)
     runner = engine.runner

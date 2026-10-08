@@ -1,4 +1,8 @@
-"""Qwen3 dense model on the flat token layout. Numerics follow transformers' Qwen3 implementation."""
+"""Qwen3 dense model on the flat token layout. Numerics follow transformers' Qwen3 implementation.
+
+With fused = True (set by the model runner), forward runs the elementwise parts in the fused kernels of
+minivllm/fused.py; the plain PyTorch path stays for comparisons.
+"""
 
 import json
 import os
@@ -9,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from safetensors import safe_open
 
+from minivllm import fused
 from minivllm.attention import AttnMetadata, store_kv
 
 
@@ -84,6 +89,14 @@ class Qwen3Attention(nn.Module):
         o = self.attn(q, k, v, self.k_cache, self.v_cache, meta)
         return self.o_proj(o.reshape(T, self.q_size))
 
+    def forward_fused(self, x, positions, cos, sin, meta: AttnMetadata):
+        """forward with the q/k norms, RoPE and the K/V write in one kernel; cos and sin are the whole bf16 tables."""
+        need_kv = meta.is_prefill and getattr(self.attn, "reads_new_kv", True)
+        q, k, v = fused.qk_norm_rope_store(self.qkv_proj(x), self.num_heads, self.num_kv_heads, self.q_norm, self.k_norm,
+                                           positions, cos, sin, self.k_cache, self.v_cache, meta.slot_mapping, need_kv)
+        o = self.attn(q, k, v, self.k_cache, self.v_cache, meta)
+        return self.o_proj(o.reshape(x.shape[0], self.q_size))
+
 
 class Qwen3MLP(nn.Module):
     def __init__(self, cfg: Qwen3Config):
@@ -94,6 +107,9 @@ class Qwen3MLP(nn.Module):
     def forward(self, x):
         gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
         return self.down_proj(F.silu(gate) * up)
+
+    def forward_fused(self, x):
+        return self.down_proj(fused.silu_mul(self.gate_up_proj(x)))
 
 
 class Qwen3DecoderLayer(nn.Module):
@@ -119,20 +135,34 @@ class Qwen3ForCausalLM(nn.Module):
         self.layers = nn.ModuleList(Qwen3DecoderLayer(cfg, attn_backend) for _ in range(cfg.num_hidden_layers))
         self.norm = RMSNorm(cfg.hidden_size, cfg.rms_norm_eps)
         self.cos = self.sin = None  # [max_positions, head_dim] fp32, built by init_rope()
+        self.rope_bf16 = None  # the same tables in bf16, as the reference forward rounds them
         self.num_kv_heads, self.head_dim = cfg.num_key_value_heads, cfg.head_dim
         self.attn_layers = [layer.self_attn for layer in self.layers]
+        self.fused = False
 
     def init_rope(self, device):
         self.cos, self.sin = rope_cache(self.cfg.head_dim, self.cfg.rope_theta, self.max_positions, device)
+        self.rope_bf16 = (self.cos.to(torch.bfloat16), self.sin.to(torch.bfloat16))
 
     def forward(self, input_ids, positions, meta: AttnMetadata):
         """input_ids, positions: [T]. Returns final hidden states [T, hidden]."""
         x = self.embed_tokens(input_ids)
+        if self.fused:
+            return self.forward_fused(x, positions, meta)
         cos = self.cos[positions].to(x.dtype).unsqueeze(1)
         sin = self.sin[positions].to(x.dtype).unsqueeze(1)
         for layer in self.layers:
             x = layer(x, cos, sin, meta)
         return self.norm(x)
+
+    def forward_fused(self, x, positions, meta):
+        # each residual add is done by the kernel of the RMSNorm after it, on x in place
+        h = fused.add_rms_norm(x, None, self.layers[0].input_layernorm)
+        for i, layer in enumerate(self.layers):
+            a = layer.self_attn.forward_fused(h, positions, *self.rope_bf16, meta)
+            m = layer.mlp.forward_fused(fused.add_rms_norm(x, a, layer.post_attention_layernorm))
+            h = fused.add_rms_norm(x, m, self.layers[i + 1].input_layernorm if i + 1 < len(self.layers) else self.norm)
+        return h
 
     def compute_logits(self, hidden):
         return F.linear(hidden, self.embed_tokens.weight)

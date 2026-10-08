@@ -7,6 +7,8 @@ from minivllm.attention import AttnMetadata
 
 
 class GatherAttention:
+    reads_new_kv = True  # prefill attends over this step's k and v as tensors
+
     def __call__(self, q, k, v, k_cache, v_cache, meta: AttnMetadata):
         # q [T, Hq, D]; k, v [T, Hkv, D] are this step's new tokens, already stored in the pools
         if meta.is_prefill:

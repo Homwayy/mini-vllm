@@ -24,14 +24,17 @@ def val_documents(n_tokens=2_000_000):
 
 
 def attention_from_args(block_size, max_tokens, max_seqs, device):
+    """The attention backend named by --attn, and whether --fused asks for the fused kernels (minivllm/fused.py)."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--attn", choices=["gather", "flex", "triton", "triton-decode"], default="gather")
-    name = parser.parse_args().attn
+    parser.add_argument("--fused", action="store_true", help="run the model's fused forward")
+    args = parser.parse_args()
+    name = args.attn
     if name == "gather":
-        return name, GatherAttention()
+        return name, GatherAttention(), args.fused
     if name.startswith("triton"):
-        return name, TritonAttention(block_size, max_tokens, max_seqs, device, flex_prefill=name == "triton-decode")
-    return name, FlexAttention(block_size, max_tokens, max_seqs, device)
+        return name, TritonAttention(block_size, max_tokens, max_seqs, device, flex_prefill=name == "triton-decode"), args.fused
+    return name, FlexAttention(block_size, max_tokens, max_seqs, device), args.fused
 
 
 def logit_stats(x, ref):

@@ -83,6 +83,7 @@ class ModelRunner:
         else:
             self.model = load_gpt2(path, attn, device)
             assert cfg.max_model_len <= self.model.max_positions
+        self.model.fused = cfg.fused_kernels
         self.sampler = Sampler(info["vocab_limit"])
         self.eos_token_ids = set(info["eos"])
 
@@ -131,6 +132,7 @@ class ModelRunner:
         self.last_verify = None  # the token bucket of the last forward if it was a verify step
         if cfg.spec == "eagle":
             self.draft = load_eagle(cfg.draft_path, self.model, attn, device)
+            self.draft.fused = cfg.fused_kernels
             a = self.draft.block.attn
             a.k_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
             a.v_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)

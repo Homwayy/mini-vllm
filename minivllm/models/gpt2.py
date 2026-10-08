@@ -2,6 +2,9 @@
 
 Numerics follow nanoGPT's generation under bf16 autocast: the token embedding, residual stream and
 LayerNorms stay in fp32; linear layers, GELU and attention run in bf16; RoPE rotates in fp32.
+
+With fused = True (set by the model runner), forward runs the elementwise parts in the fused kernels of
+minivllm/fused.py; the plain PyTorch path stays for training and for exact comparisons with nanoGPT.
 """
 
 import re
@@ -11,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from minivllm import fused
 from minivllm.attention import AttnMetadata, store_kv
 
 
@@ -59,6 +63,14 @@ class GPT2Attention(nn.Module):
         o = self.attn(q, k, v, self.k_cache, self.v_cache, meta)
         return self.c_proj(o.reshape(T, -1))
 
+    def forward_fused(self, x, positions, cos, sin, meta: AttnMetadata):
+        """forward with RoPE and the K/V write in one kernel; cos and sin are the whole tables."""
+        need_kv = meta.is_prefill and getattr(self.attn, "reads_new_kv", True)
+        q, k, v = fused.rope_store(self.c_attn(x), self.num_heads, positions, cos, sin, self.k_cache, self.v_cache,
+                                   meta.slot_mapping, need_kv)
+        o = self.attn(q, k, v, self.k_cache, self.v_cache, meta)
+        return self.c_proj(o.reshape(x.shape[0], -1))
+
 
 class GPT2MLP(nn.Module):
     def __init__(self, cfg: GPT2Config):
@@ -84,6 +96,12 @@ class GPT2Block(nn.Module):
         x = x + self.attn(self.ln_1(x).to(dtype), cos, sin, meta)
         return x + self.mlp(self.ln_2(x).to(dtype))
 
+    def forward_fused(self, x, positions, cos, sin, meta):
+        """forward for a block on its own (EAGLE's draft), with fused kernels; updates x in place."""
+        dtype = self.mlp.c_fc.weight.dtype
+        a = self.attn.forward_fused(fused.add_layer_norm(x, None, self.ln_1, dtype), positions, cos, sin, meta)
+        return x.add_(self.mlp(fused.add_layer_norm(x, a, self.ln_2, dtype)))
+
 
 class GPT2ForCausalLM(nn.Module):
     def __init__(self, cfg: GPT2Config, attn_backend):
@@ -97,14 +115,28 @@ class GPT2ForCausalLM(nn.Module):
         self.cos = self.sin = None
         self.num_kv_heads, self.head_dim = cfg.n_head, cfg.n_embd // cfg.n_head
         self.attn_layers = [block.attn for block in self.layers]
+        self.fused = False
 
     def forward(self, input_ids, positions, meta: AttnMetadata):
         """input_ids, positions: [T]. Returns final hidden states [T, n_embd] in fp32."""
         x = self.wte(input_ids)
+        if self.fused:
+            return self.forward_fused(x, positions, meta)
         cos, sin = self.cos[positions].unsqueeze(1), self.sin[positions].unsqueeze(1)
         for block in self.layers:
             x = block(x, cos, sin, meta)
         return self.ln_f(x)
+
+    def forward_fused(self, x, positions, meta):
+        # each residual add is done by the kernel of the LayerNorm after it, on x in place
+        dtype = self.layers[0].mlp.c_fc.weight.dtype
+        h = fused.add_layer_norm(x, None, self.layers[0].ln_1, dtype)
+        for i, block in enumerate(self.layers):
+            a = block.attn.forward_fused(h, positions, self.cos, self.sin, meta)
+            m = block.mlp(fused.add_layer_norm(x, a, block.ln_2, dtype))
+            if i + 1 < len(self.layers):
+                h = fused.add_layer_norm(x, m, self.layers[i + 1].ln_1, dtype)
+        return fused.add_layer_norm(x, m, self.ln_f, torch.float32)
 
     def compute_logits(self, hidden):
         return F.linear(hidden.to(self.lm_head_weight.dtype), self.lm_head_weight)

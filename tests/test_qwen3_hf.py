@@ -5,7 +5,9 @@
 2. Greedy decoding: our batched decode vs HF's bf16 decode, token by token.
 3. Teacher forcing: our per-step decode logits vs the fp32 reference on the same tokens.
 
-Run from the repo root: python -m tests.test_qwen3_hf [--attn gather|flex|triton|triton-decode]
+With --fused, our model runs its fused forward (minivllm/fused.py), and the results get the suffix _fused.
+
+Run from the repo root: python -m tests.test_qwen3_hf [--attn gather|flex|triton|triton-decode] [--fused]
 """
 
 import json
@@ -55,10 +57,11 @@ def main():
     device = "cuda"
     torch.cuda.init()
     cap_gpu_memory()
-    attn_name, attn = attention_from_args(BLOCK_SIZE, 4096, len(PROMPT_LENS), device)
+    attn_name, attn, fused = attention_from_args(BLOCK_SIZE, 4096, len(PROMPT_LENS), device)
     tok = AutoTokenizer.from_pretrained(CKPT)
     prompts = real_text_prompts(tok, PROMPT_LENS)
     model = load_qwen3(CKPT, attn, device)
+    model.fused = fused
     hf16 = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.bfloat16).to(device).eval()
     hf32 = AutoModelForCausalLM.from_pretrained(CKPT, dtype=torch.float32).to(device).eval()
 
@@ -97,9 +100,9 @@ def main():
 
     print("sample:", repr(tok.decode(prompts[1][-20:] + our_tokens[1][:30])))
     os.makedirs("results", exist_ok=True)
-    out = os.path.join("results", f"e0_qwen3_{attn_name}.json")
+    out = os.path.join("results", f"e0_qwen3_{attn_name}{'_fused' if fused else ''}.json")
     with open(out, "w") as f:
-        json.dump({"model": "Qwen3-0.6B", "attention": attn_name, "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
+        json.dump({"model": "Qwen3-0.6B", "attention": attn_name, "fused": fused, "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
     print("wrote", out)
 
 

@@ -11,7 +11,10 @@ the same model without autocast gives the fp32 reference.
    matmuls have more rows and cuBLAS may pick different kernels, so small differences there are expected.
    Other backends are judged by their errors against the fp32 reference.
 
-Run from the repo root: python -m tests.test_gpt2_nanogpt [--attn gather|flex|triton|triton-decode]
+With --fused, our model runs its fused forward (minivllm/fused.py), and the results get the suffix _fused.
+Its LayerNorm sums in another order than PyTorch's, so the bitwise checks of 4 are not expected to hold.
+
+Run from the repo root: python -m tests.test_gpt2_nanogpt [--attn gather|flex|triton|triton-decode] [--fused]
 """
 
 import json
@@ -57,9 +60,10 @@ def main():
     device = "cuda"
     torch.cuda.init()
     cap_gpu_memory()
-    attn_name, attn = attention_from_args(BLOCK_SIZE, 4096, len(PROMPT_LENS), device)
+    attn_name, attn, fused = attention_from_args(BLOCK_SIZE, 4096, len(PROMPT_LENS), device)
     prompts = prompts_from_val(PROMPT_LENS)
     model = load_gpt2(CKPT, attn, device)
+    model.fused = fused
     nano = load_nanogpt(device)
     autocast = torch.autocast("cuda", dtype=torch.bfloat16)
 
@@ -119,9 +123,9 @@ def main():
         print(f"  alone: prefill bitwise equal {r['alone_prefill_bitwise_equal']}, greedy identical {r['alone_greedy_identical']}")
 
     os.makedirs("results", exist_ok=True)
-    out = os.path.join("results", f"e0_gpt2_{attn_name}.json")
+    out = os.path.join("results", f"e0_gpt2_{attn_name}{'_fused' if fused else ''}.json")
     with open(out, "w") as f:
-        json.dump({"model": "nanoGPT GPT-2 124M", "attention": attn_name, "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
+        json.dump({"model": "nanoGPT GPT-2 124M", "attention": attn_name, "fused": fused, "block_size": BLOCK_SIZE, "new_tokens": NEW_TOKENS, "prompts": results}, f, indent=2)
     print("wrote", out)
 
 
