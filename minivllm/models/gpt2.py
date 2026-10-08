@@ -116,6 +116,9 @@ class GPT2ForCausalLM(nn.Module):
         self.num_kv_heads, self.head_dim = cfg.n_head, cfg.n_embd // cfg.n_head
         self.attn_layers = [block.attn for block in self.layers]
         self.fused = False
+        # blocks whose LayerNorm'd inputs (bf16) forward keeps in self.captured, in order (DSpark's features)
+        self.capture = ()
+        self.captured = []
 
     def forward(self, input_ids, positions, meta: AttnMetadata):
         """input_ids, positions: [T]. Returns final hidden states [T, n_embd] in fp32."""
@@ -123,7 +126,10 @@ class GPT2ForCausalLM(nn.Module):
         if self.fused:
             return self.forward_fused(x, positions, meta)
         cos, sin = self.cos[positions].unsqueeze(1), self.sin[positions].unsqueeze(1)
-        for block in self.layers:
+        self.captured = []
+        for i, block in enumerate(self.layers):
+            if i in self.capture:
+                self.captured.append(block.ln_1(x).to(block.mlp.c_fc.weight.dtype))
             x = block(x, cos, sin, meta)
         return self.ln_f(x)
 
@@ -131,11 +137,14 @@ class GPT2ForCausalLM(nn.Module):
         # each residual add is done by the kernel of the LayerNorm after it, on x in place
         dtype = self.layers[0].mlp.c_fc.weight.dtype
         h = fused.add_layer_norm(x, None, self.layers[0].ln_1, dtype)
+        self.captured = [h] if 0 in self.capture else []
         for i, block in enumerate(self.layers):
             a = block.attn.forward_fused(h, positions, self.cos, self.sin, meta)
             m = block.mlp(fused.add_layer_norm(x, a, block.ln_2, dtype))
             if i + 1 < len(self.layers):
                 h = fused.add_layer_norm(x, m, self.layers[i + 1].ln_1, dtype)
+                if i + 1 in self.capture:
+                    self.captured.append(h)
         return fused.add_layer_norm(x, m, self.ln_f, torch.float32)
 
     def compute_logits(self, hidden):
