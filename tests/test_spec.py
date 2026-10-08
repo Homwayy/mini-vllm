@@ -7,6 +7,9 @@ another distribution q (EAGLE's), given in the order of a draft vocabulary, and 
 several blocks of the fused kernels and is cut by a vocab limit. Greedy rows accept exactly the drafts that
 match the argmax.
 
+Drafting draws each draft with one kernel (sample_drafts): greedy rows take the first argmax, sampled rows keep
+q = softmax(logits / t) and draw from it, independently across rows, steps and CUDA graph replays.
+
 Run from the repo root: python -m tests.test_spec
 """
 
@@ -16,7 +19,8 @@ import torch
 
 from minivllm.sampler import Sampler
 from minivllm.sequence import SamplingParams, Sequence
-from minivllm.spec import rejection
+from minivllm.spec import draft_sampling, rejection
+from minivllm.spec.draft_sampling import sample_drafts
 from minivllm.spec.ngram import NgramProposer
 from minivllm.spec.rejection import verify_drafts
 from tests.test_sampler import expected
@@ -163,6 +167,88 @@ def test_large_vocab():
     assert ok
 
 
+def test_draft_sampling():
+    # a vocabulary of two blocks of the kernel (with many rows) and part of a third, in the order of a draft
+    # vocabulary; a single block with few rows
+    torch.manual_seed(3)
+    b = draft_sampling.CONFIGS[False][0]
+    V = 2 * b + 1000
+    vocab = torch.randperm(50_000, device="cuda")[:V]
+    seed = torch.zeros(1, dtype=torch.int64, device="cuda")
+
+    def run(x, temp, bias=None, step=0):
+        tok = torch.zeros(x.shape[0], 2, dtype=torch.int64, device="cuda")  # a strided column, as in the chain
+        prev = torch.zeros(x.shape[0], dtype=torch.int64, device="cuda")
+        probs = torch.zeros(x.shape[0], 2, V, device="cuda")
+        sample_drafts(x, temp, seed, vocab, tok[:, 1], prev, probs[:, 1], step, bias)
+        assert torch.equal(tok[:, 1], prev)
+        return tok[:, 1], probs[:, 1]
+
+    for rows in (64, draft_sampling.FEW_ROWS):
+        # greedy rows with many ties take the first argmax, as torch.argmax does
+        x = torch.randint(-4, 5, (rows, V), device="cuda").bfloat16()
+        bias = torch.randint(-2, 3, (rows, V), device="cuda").bfloat16()
+        greedy = torch.zeros(rows, device="cuda")
+        assert torch.equal(run(x, greedy)[0], vocab[x.float().argmax(-1)])
+        assert torch.equal(run(x, greedy, bias)[0], vocab[(x.float() + bias.float()).argmax(-1)])
+        # sampled rows keep q
+        x = (3 * torch.randn(rows, V, device="cuda")).bfloat16()
+        for t in (0.5, 1.0, 1.7):
+            for bb in (None, bias):
+                want = torch.softmax((x.float() + (0.0 if bb is None else bb.float())) / t, -1)
+                assert (run(x, torch.full((rows,), t, device="cuda"), bb)[1] - want).abs().max().item() < 1e-6
+    # frequencies of likely tokens on both sides of block edges and at the end, and of all others together;
+    # every 8 calls share a seed, with steps 0-7. Odd rows are greedy.
+    hot = torch.tensor([5, b - 1, b, b + 400, V - 1], device="cuda")
+    x = torch.full((V,), -6.0, device="cuda")
+    x[hot] = torch.tensor([3.0, 2.5, 2.0, 1.5, 1.0], device="cuda")
+    shift = torch.zeros(V, device="cuda")
+    shift[b] = 1.0  # puts token b ahead of b - 1
+    ok = True
+    for rows, t, bias in ((4000, 1.0, None), (4000, 0.7, shift), (draft_sampling.FEW_ROWS, 1.0, shift)):
+        logits = x.bfloat16().expand(rows, V)
+        bb = None if bias is None else bias.bfloat16().expand(rows, V)
+        full = logits[0].float() + (0.0 if bb is None else bb[0].float())
+        temp = torch.tensor([t, 0.0], device="cuda").repeat(rows // 2)
+        sampled = []
+        for i in range(2 * N // rows):
+            if i % 8 == 0:
+                seed.random_(2**31 - 1)
+            tok, _ = run(logits, temp, bb, step=i % 8)
+            sampled.append(tok[0::2])
+            ok &= bool((tok[1::2] == vocab[full.argmax()]).all())
+        sub = torch.cat(sampled)
+        freq = torch.cat([(sub[:, None] == vocab[hot]).float().mean(0), (~torch.isin(sub, vocab[hot])).float().mean()[None]])
+        e = torch.softmax(full / t, -1)
+        err = (freq - torch.cat([e[hot], 1 - e[hot].sum()[None]])).abs().max().item()
+        ok &= err < tolerance(len(sub))
+        print(f"draft sampling, {rows} rows, temperature {t}{', with a bias' if bias is not None else ''}: max |freq - exact| {err:.4f}")
+    assert ok
+    # in a CUDA graph the seed is redrawn on each replay: draws differ between replays, torch.manual_seed fixes them
+    x, temp = torch.zeros(256, V, device="cuda").bfloat16(), torch.ones(256, device="cuda")
+    tok, prev, probs = (torch.zeros(256, dtype=torch.int64, device="cuda"), torch.zeros(256, dtype=torch.int64, device="cuda"),
+                        torch.zeros(256, V, device="cuda"))
+
+    def draft():
+        seed.random_(2**31 - 1)
+        sample_drafts(x, temp, seed, vocab, tok, prev, probs, 0)
+
+    draft()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        draft()
+    draws = []
+    for s in (0, 0, 1):
+        torch.manual_seed(s)
+        graph.replay()
+        draws.append(tok.clone())
+        graph.replay()
+        draws.append(tok.clone())
+    assert torch.equal(draws[0], draws[2]) and torch.equal(draws[1], draws[3])
+    assert (draws[0] != draws[1]).float().mean() > 0.99 and (draws[0] != draws[4]).float().mean() > 0.99
+    print("test_draft_sampling: ok")
+
+
 def test_greedy_prefix():
     sampler = Sampler()
     base = torch.tensor([2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -3.0], device="cuda")
@@ -183,4 +269,5 @@ if __name__ == "__main__":
     test_distribution()
     test_distribution_sampled_drafts()
     test_large_vocab()
+    test_draft_sampling()
     print("PASS")

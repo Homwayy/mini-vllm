@@ -170,7 +170,8 @@ def load_dspark(path, target, attn_backend, device="cuda", dtype=torch.bfloat16)
     a = ckpt["args"]
     draft = DSparkDraft(target.cfg, attn_backend, ckpt["vocab_ids"], a["block_len"], a["rank"], ckpt["feature_layers"])
     draft.load_state_dict(ckpt["draft"])
-    for m in (draft.fc, draft.block.attn, draft.block.mlp, draft.markov_out, draft.conf):
+    # markov_in's rows are cast before use anyway, so a bf16 table saves a cast per draft
+    for m in (draft.fc, draft.block.attn, draft.block.mlp, draft.markov_in, draft.markov_out, draft.conf):
         m.to(dtype)
     draft.to(device)
     draft.attach(target)

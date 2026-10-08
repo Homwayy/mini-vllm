@@ -26,6 +26,9 @@ draft's prefill over the prompt, with the target's prefill layout (in its buffer
 With DSpark drafting, the target's forward itself writes the draft's context K/V for all its rows, so there is
 no catch-up; drafting is one graph per batch bucket: the forward of a block of rows from each sequence's anchor,
 and the sampling of its tokens with the Markov head (minivllm/spec/dspark.py).
+
+Both draw each draft token with one kernel (minivllm/spec/draft_sampling.py), keyed by a seed that every
+drafting redraws on the GPU, so a graph replay samples afresh.
 """
 
 import itertools
@@ -45,6 +48,7 @@ from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
 from minivllm.sampler import Sampler
 from minivllm.sequence import Sequence
+from minivllm.spec.draft_sampling import sample_drafts
 from minivllm.spec.dspark import block_inputs_kernel, load_dspark
 from minivllm.spec.eagle import draft_inputs_kernel, load_eagle
 from minivllm.spec.rejection import verify_drafts
@@ -167,6 +171,8 @@ class ModelRunner:
             # drafting writes up to num_spec_tokens - 1 positions past a sequence; past its blocks, into scratch
             self.ch_block_tables = torch.zeros(s, cdiv(cfg.max_model_len + g, cfg.block_size), dtype=torch.int32, device=device)
             self.ch_tokens = torch.zeros(s, g, dtype=torch.int64, device=device)
+            self.ch_prev = torch.zeros(s, dtype=torch.int64, device=device)  # each row's latest draft
+            self.draft_seed = torch.zeros(1, dtype=torch.int64, device=device)  # redrawn before each drafting
             self.ch_probs = torch.zeros(s, g, len(self.draft.vocab_ids), dtype=torch.float32, device=device)
             self.verify_out = torch.zeros(s, 2, dtype=torch.int64, device=device)  # per sequence: accepted drafts, next token
         if cfg.spec == "eagle":
@@ -312,15 +318,11 @@ class ModelRunner:
         Greedy rows take the argmax; the others sample at their temperature and keep the distribution."""
         bs, g = self.cfg.block_size, self.cfg.num_spec_tokens
         h, pos, bt, temp = self.ch_g[:padded], self.ch_pos[:padded], self.ch_block_tables[:padded], self.ch_temp[:padded]
-        sampled = temp > 0
-        t = torch.where(sampled, temp, 1.0)[:, None]
+        tok = self.ch_prev[:padded]
+        self.draft_seed.random_(2**31 - 1)
         for k in range(g):
-            logits = self.draft.logits(h).float()
-            q = torch.softmax(logits / t, dim=-1)
-            pick = torch.where(sampled, (q / torch.empty_like(q).exponential_()).argmax(-1), logits.argmax(-1))
-            tok = self.draft.vocab_ids[pick]
-            self.ch_tokens[:padded, k] = tok
-            self.ch_probs[:padded, k] = q
+            sample_drafts(self.draft.logits(h), temp, self.draft_seed, self.draft.vocab_ids, self.ch_tokens[:padded, k], tok,
+                          self.ch_probs[:padded, k], k)
             if k == g - 1:
                 break
             p = pos + k
@@ -340,18 +342,12 @@ class ModelRunner:
         meta = AttnMetadata(is_prefill=True, slot_mapping=slots, block_tables=bt, context_lens=(self.ch_pos[:padded] + g).int(),
                             backend_state=(self.blk_cu[: padded + 1], self.blk_block_m))
         h = self.draft(anchors, pos.clamp(max=self.cfg.max_model_len - 1), meta)
-        u = self.draft.logits(h).float().view(padded, g, -1)
-        temp = self.ch_temp[:padded]
-        sampled = temp > 0
-        t = torch.where(sampled, temp, 1.0)[:, None]
-        prev = anchors
+        u = self.draft.logits(h).view(padded, g, -1)
+        temp, prev = self.ch_temp[:padded], self.ch_prev[:padded]
+        self.draft_seed.random_(2**31 - 1)
         for k in range(g):
-            logits = u[:, k] + self.draft.transition(prev).float()
-            q = torch.softmax(logits / t, dim=-1)
-            pick = torch.where(sampled, (q / torch.empty_like(q).exponential_()).argmax(-1), logits.argmax(-1))
-            prev = self.draft.vocab_ids[pick]
-            self.ch_tokens[:padded, k] = prev
-            self.ch_probs[:padded, k] = q
+            sample_drafts(u[:, k], temp, self.draft_seed, self.draft.vocab_ids, self.ch_tokens[:padded, k], prev,
+                          self.ch_probs[:padded, k], k, bias=self.draft.transition(anchors if k == 0 else prev))
 
     @torch.inference_mode()
     def dspark_next(self, entries):
