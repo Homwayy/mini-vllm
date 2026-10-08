@@ -106,33 +106,35 @@ def test_distribution_sampled_drafts():
 
 
 def test_large_vocab():
-    # 5000 columns, cut at 4600: likely tokens on both sides of a block edge of the fused kernels (2048), and
-    # the largest logit past the limit, which must never come out. Frequencies are checked for the likely
-    # tokens and for all the others together.
+    # two blocks of the fused kernels and a partial third, cut by a vocab limit: likely tokens on both sides of
+    # a block edge and at the limit, and the largest logit past the limit, which must never come out.
+    # Frequencies are checked for the likely tokens and for all the others together.
     torch.manual_seed(2)
-    V, limit, hot = 5000, 4600, [5, 2047, 2048, 2500, 4599]
+    b = rejection.BLOCK
+    V, limit = 2 * b + 1000, 2 * b + 600
+    hot = [5, b - 1, b, b + 400, limit - 1]
     hot_t = torch.tensor(hot, device="cuda")
 
     def row(shift):
         x = torch.full((V,), -6.0, device="cuda")
         x[hot_t] = torch.tensor([3.0, 2.5, 2.0, 1.5, 1.0], device="cuda").roll(shift)
-        x[4700] = 10.0
+        x[limit + 100] = 10.0
         return x
 
-    rows = torch.stack([row(1), row(3), row(0)])  # argmaxes 2047, 2500 and 5
-    drafts = [2047, 2500]
+    rows = torch.stack([row(1), row(3), row(0)])  # argmaxes b - 1, b + 400 and 5
+    drafts = [b - 1, b + 400]
     vocab = torch.tensor(sorted(set(range(0, limit, 2)) | set(hot)), device="cuda")
     boost = torch.zeros(len(vocab), device="cuda")
-    q = torch.stack([boost.index_put((torch.searchsorted(vocab, hot_t),), torch.tensor(b, device="cuda"))
-                     for b in ([0.0, 3.0, 3.0, 1.0, 0.0], [3.0, 0.0, 1.0, 3.0, 0.0])])
+    q = torch.stack([boost.index_put((torch.searchsorted(vocab, hot_t),), torch.tensor(w, device="cuda"))
+                     for w in ([0.0, 3.0, 3.0, 1.0, 0.0], [3.0, 0.0, 1.0, 3.0, 0.0])])
     q = torch.softmax(q - 2.0 * (q == 0), -1)  # [2 positions, len(vocab)]
     sampler, chunk = Sampler(limit), 4000
     g = SamplingParams(temperature=0.0)
     full = rejection._verify_full
     rejection._verify_full = None  # every case here must take the fused kernels
     try:
-        assert verify_drafts(sampler, rows, [g], [drafts]) == [[2047, 2500, 5]]
-        assert verify_drafts(sampler, rows, [g], [[2047, 2048]]) == [[2047, 2500]]
+        assert verify_drafts(sampler, rows, [g], [drafts]) == [drafts + [5]]
+        assert verify_drafts(sampler, rows, [g], [[b - 1, b]]) == [[b - 1, b + 400]]
         ok = True
         for p, sampled in ((SamplingParams(temperature=1.0), False), (SamplingParams(temperature=0.7), False),
                            (SamplingParams(temperature=1.0), True), (SamplingParams(temperature=0.7), True)):
