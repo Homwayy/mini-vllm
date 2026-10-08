@@ -146,14 +146,16 @@ def block_inputs_kernel(pos_ptr, cu_ptr, bt_ptr, bt_stride, bt_width, accepted_p
                         anchor_ptr, ch_pos_ptr, ch_temp_ptr, ch_bt_ptr, ch_bt_stride, ch_bt_width, BT_BLOCK: tl.constexpr):
     """One program per block after a verify step. Sequence i accepted a drafts: its anchor is the target's token
     after them, one position past its row a of the verify step; the block uses the verify step's block table.
-    Rows past the sequences are padding: position 0, greedy, scratch block."""
+    Rows past the sequences are padding: position 0, greedy, scratch block. So is a sequence that drafts no more
+    (temperature < 0), since the blocks it held may already belong to another sequence."""
     i = tl.program_id(0)
     cols = tl.arange(0, BT_BLOCK)
-    if i < num_seqs:
+    temp = tl.load(temp_ptr + i, mask=i < num_seqs, other=-1.0)
+    if temp >= 0:
         a = tl.load(accepted_ptr + 2 * i)
         tl.store(anchor_ptr + i, tl.load(accepted_ptr + 2 * i + 1))
         tl.store(ch_pos_ptr + i, tl.load(pos_ptr + tl.load(cu_ptr + i) + a) + 1)
-        tl.store(ch_temp_ptr + i, tl.load(temp_ptr + i))
+        tl.store(ch_temp_ptr + i, temp)
         bt = tl.load(bt_ptr + i * bt_stride + cols, mask=cols < bt_width, other=scratch_block)
         tl.store(ch_bt_ptr + i * ch_bt_stride + cols, bt, mask=cols < ch_bt_width)
     else:

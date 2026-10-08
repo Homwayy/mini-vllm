@@ -19,8 +19,9 @@ several chunks and mixed with decoding; mixed steps run in CUDA graphs too, so t
 them. A small pool preempts sequences in the middle of their prompts.
 
 Speculative decoding (n-gram drafts) runs on prompts that repeat a segment, so drafts are found; the check
-requires both accepted and rejected drafts. Verify steps run in CUDA graphs too. EAGLE drafting runs if its
-trained draft model (checkpoints/gpt2_eagle.pt) exists; its catch-up and draft chain are captured as well.
+requires both accepted and rejected drafts. Verify steps run in CUDA graphs too. EAGLE and DSpark drafting run
+if their trained draft models (checkpoints/gpt2_eagle.pt, checkpoints/gpt2_dspark.pt) exist; EAGLE's catch-up
+and draft chain, and DSpark's block, are captured as well.
 
 Run from the repo root: python -m tests.test_engine
 """
@@ -236,15 +237,19 @@ def main():
     del engine
     torch.cuda.empty_cache()
 
-    eagle_cfg = EngineConfig(**{**gcfg.__dict__, "spec": "eagle"})
-    if os.path.exists(eagle_cfg.draft_path):
-        engine = LLMEngine(eagle_cfg)
+    for spec in ("eagle", "dspark"):
+        path = os.path.join("checkpoints", f"gpt2_{spec}.pt")
+        if not os.path.exists(path):
+            print(f"spec {spec}: skipped, no draft model at {path}")
+            continue
+        spec_cfg = EngineConfig(**{**gcfg.__dict__, "spec": spec})
+        engine = LLMEngine(spec_cfg)
         prompts, params = make_requests(24, 50257, 300, 80, seed=1)
         for case in (CASES[2], CASES[4], CASES[1]):
-            engine.cfg = EngineConfig(**{**eagle_cfg.__dict__, **case})
+            engine.cfg = EngineConfig(**{**spec_cfg.__dict__, **case})
             engine.reset()
-            ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case} spec eagle")
-        engine.cfg = eagle_cfg
+            ok &= run_case(engine, prompts, params, f"gpt2 {gcfg.attention} {case} spec {spec}")
+        engine.cfg = spec_cfg
         # top-p takes the full acceptance path, plain temperature the fused kernels
         for sp in (SamplingParams(temperature=0.8, top_p=0.95), SamplingParams(temperature=1.0)):
             engine.reset()
@@ -254,12 +259,12 @@ def main():
             sample_ok = all(s.num_completion_tokens == p.max_tokens for s, p in zip(seqs, sampled))
             accepted = sum(r.num_accepted for r in engine.steps)
             dropped = all(s.draft_probs is None for s in seqs)  # finished sequences keep no draft distributions
-            print(f"gpt2 spec eagle sampling (temperature {sp.temperature}, top_p {sp.top_p}): lengths "
+            print(f"gpt2 spec {spec} sampling (temperature {sp.temperature}, top_p {sp.top_p}): lengths "
                   f"{'ok' if sample_ok else 'WRONG'}, drafts accepted {accepted} / {sum(r.num_draft for r in engine.steps)}, "
                   f"draft distributions {'dropped' if dropped else 'KEPT'}")
             ok &= sample_ok and accepted > 0 and dropped
-    else:
-        print(f"spec eagle: skipped, no draft model at {eagle_cfg.draft_path}")
+        del engine
+        torch.cuda.empty_cache()
     print("PASS" if ok else "FAIL")
 
 

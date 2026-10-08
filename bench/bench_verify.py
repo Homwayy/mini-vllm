@@ -20,7 +20,6 @@ import torch
 from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile
 
-from minivllm.engine import EngineConfig
 from minivllm.model_runner import MODELS
 from minivllm.sampler import Sampler
 from minivllm.sequence import SamplingParams
@@ -68,7 +67,7 @@ def main():
     args = ap.parse_args()
 
     torch.manual_seed(0)
-    ckpt = torch.load(EngineConfig().draft_path, map_location="cpu")
+    ckpt = torch.load(os.path.join("checkpoints", "gpt2_eagle.pt"), map_location="cpu")
     vocab = torch.tensor(ckpt["vocab_ids"], device="cuda")
     sampler = Sampler(MODELS["gpt2"]["vocab_limit"])
     rows = []

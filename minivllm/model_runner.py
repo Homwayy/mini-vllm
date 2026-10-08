@@ -22,6 +22,10 @@ verified (again a mixed step, over the draft's own KV pool), then drafts num_spe
 in a chain of single-row steps; both are captured as CUDA graphs. After a verify step, both take their
 inputs from the verify step's buffers and acceptance on the GPU. After a prefill, the catch-up is the
 draft's prefill over the prompt, with the target's prefill layout (in its buffers, if padded).
+
+With DSpark drafting, the target's forward itself writes the draft's context K/V for all its rows, so there is
+no catch-up; drafting is one graph per batch bucket: the forward of a block of rows from each sequence's anchor,
+and the sampling of its tokens with the Markov head (minivllm/spec/dspark.py).
 """
 
 import itertools
@@ -41,6 +45,7 @@ from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
 from minivllm.sampler import Sampler
 from minivllm.sequence import Sequence
+from minivllm.spec.dspark import block_inputs_kernel, load_dspark
 from minivllm.spec.eagle import draft_inputs_kernel, load_eagle
 from minivllm.spec.rejection import verify_drafts
 
@@ -138,8 +143,9 @@ class ModelRunner:
             w = max(w, cdiv(t, cfg.block_size))
             self.mix_block_tables = torch.zeros(n, w, dtype=torch.int32, device=device)
         self.mixed_graphs = {}  # token bucket -> (CUDAGraph, hidden-state output)
-        # EAGLE: the draft model, with one more KV pool in the target's layout (draft position t in the slot of
-        # target position t), and the static buffers of its catch-up and drafting steps
+        # EAGLE or DSpark: the draft model, with one more KV pool in the target's layout (draft position t in the
+        # slot of target position t), and the static buffers of its drafting steps (and EAGLE's catch-up)
+        self.spec = cfg.spec
         self.draft = None
         self.draft_graphs = {}  # token bucket -> (CUDAGraph, draft output) for catching up
         self.draft_prefill_graphs = {}  # prefill token bucket -> (CUDAGraph, draft output)
@@ -147,24 +153,34 @@ class ModelRunner:
         self.last = None  # the last forward, for drafting: (sequences, hidden states, first row of each, prefill meta and positions)
         self.last_verify = None  # the token bucket of the last forward if it was a verify step
         self.last_prefill = None  # the token bucket of the last forward if it was a padded prefill step
-        if cfg.spec == "eagle":
-            self.draft = load_eagle(cfg.draft_path, self.model, attn, device)
+        if cfg.spec in ("eagle", "dspark"):
+            path = cfg.draft_path or os.path.join("checkpoints", f"gpt2_{cfg.spec}.pt")
+            self.draft = (load_eagle if cfg.spec == "eagle" else load_dspark)(path, self.model, attn, device)
             self.draft.fused = cfg.fused_kernels
             a = self.draft.block.attn
             a.k_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
             a.v_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
             self.kv_bytes += 2 * a.k_cache.numel() * a.k_cache.element_size()
             d, s, g = self.model.cfg.n_embd, self.buckets[-1], cfg.num_spec_tokens
-            self.mix_feat = torch.zeros(self.mix_ids.shape[0], d, dtype=torch.float32, device=device)
-            self.ch_g = torch.zeros(s, d, dtype=torch.float32, device=device)
             self.ch_pos = torch.zeros(s, dtype=torch.int64, device=device)
             self.ch_temp = torch.zeros(s, dtype=torch.float32, device=device)
-            # the chain writes up to num_spec_tokens - 2 positions past a sequence; past its blocks, into scratch
+            # drafting writes up to num_spec_tokens - 1 positions past a sequence; past its blocks, into scratch
             self.ch_block_tables = torch.zeros(s, cdiv(cfg.max_model_len + g, cfg.block_size), dtype=torch.int32, device=device)
             self.ch_tokens = torch.zeros(s, g, dtype=torch.int64, device=device)
             self.ch_probs = torch.zeros(s, g, len(self.draft.vocab_ids), dtype=torch.float32, device=device)
-            self.ch_rows = torch.zeros(s, dtype=torch.int64, device=device)  # the catch-up row each chain row starts from
             self.verify_out = torch.zeros(s, 2, dtype=torch.int64, device=device)  # per sequence: accepted drafts, next token
+        if cfg.spec == "eagle":
+            self.mix_feat = torch.zeros(self.mix_ids.shape[0], d, dtype=torch.float32, device=device)
+            self.ch_g = torch.zeros(s, d, dtype=torch.float32, device=device)
+            self.ch_rows = torch.zeros(s, dtype=torch.int64, device=device)  # the catch-up row each chain row starts from
+        if cfg.spec == "dspark":
+            assert g <= self.draft.block_len, f"the draft model was trained for blocks of up to {self.draft.block_len} rows"
+            self.model.capture = self.draft.feature_layers
+            self.ch_anchor = torch.zeros(s, dtype=torch.int64, device=device)  # each block's anchor token
+            # a block's rows are a mixed step of g tokens per sequence: fixed cu_seqlens, tiles for g rows
+            self.blk_cu = torch.arange(0, (s + 1) * g, g, dtype=torch.int32, device=device)
+            self.blk_offsets = torch.arange(g, device=device)
+            self.blk_block_m = prefill_block_m(g, self.group_pad)
         self.use_cuda_graph = False
         self.graph_capture_s = 0.0
         self.graph_memory_bytes = 0
@@ -219,7 +235,7 @@ class ModelRunner:
             is_prefill=False, slot_mapping=self.dec_slots[:padded], block_tables=self.dec_block_tables[:padded],
             context_lens=self.dec_context_lens[:padded], max_context_len=max_context_len,
         )
-        return self.model(self.dec_ids[:padded], self.dec_pos[:padded], meta)
+        return self.target_forward(self.dec_ids[:padded], self.dec_pos[:padded], meta)
 
     def fill_mixed_buffers(self, entries, padded: int):
         """Writes a mixed step into the static buffers; returns the first row of each entry, then the end.
@@ -260,22 +276,35 @@ class ModelRunner:
         )
 
     def mixed_hidden(self, padded: int, prefill=False):
-        return self.model(self.mix_ids[:padded], self.mix_pos[:padded], self.mixed_meta(padded, prefill))
+        return self.target_forward(self.mix_ids[:padded], self.mix_pos[:padded], self.mixed_meta(padded, prefill))
 
     def draft_hidden(self, padded: int, prefill=False):
         """The draft model over a mixed step in the static buffers, with features from mix_feat."""
         return self.draft(self.mix_feat[:padded], self.mix_ids[:padded], self.mix_pos[:padded], self.mixed_meta(padded, prefill))
 
     def fill_chain_buffers(self, seqs: list[Sequence], padded: int):
-        """Writes where each sequence's draft chain starts: its last position, block table and temperature."""
+        """Writes where each sequence's draft chain (or DSpark block) starts: its last position and token, block
+        table and temperature."""
         pos = np.zeros(padded, np.int64)
+        last = np.zeros(padded, np.int64)
         temp = np.zeros(padded, np.float32)
         block_tables = np.full((padded, self.ch_block_tables.shape[1]), self.scratch_block, np.int32)
         for i, seq in enumerate(seqs):
-            pos[i], temp[i] = len(seq) - 1, seq.params.temperature
+            pos[i], last[i], temp[i] = len(seq) - 1, seq.token_ids[-1], seq.params.temperature
             block_tables[i, : len(seq.block_table)] = seq.block_table
-        for buf, x in ((self.ch_pos, pos), (self.ch_temp, temp), (self.ch_block_tables, block_tables)):
+        bufs = [(self.ch_pos, pos), (self.ch_temp, temp), (self.ch_block_tables, block_tables)]
+        if self.spec == "dspark":
+            bufs.append((self.ch_anchor, last))
+        for buf, x in bufs:
             buf[:padded].copy_(torch.from_numpy(x))
+
+    def target_forward(self, input_ids, positions, meta: AttnMetadata):
+        """The target model's forward. With DSpark drafting, it also writes the context K/V of every row into the
+        draft model's pool, before acceptance is known (see minivllm/spec/dspark.py)."""
+        hidden = self.model(input_ids, positions, meta)
+        if self.spec == "dspark":
+            self.draft.inject(self.model.captured + [hidden], positions, meta)
+        return hidden
 
     def draft_chain(self, padded: int):
         """Drafts num_spec_tokens tokens per row of ch_g, the draft's output at each sequence's last verified
@@ -299,11 +328,74 @@ class ModelRunner:
             meta = AttnMetadata(is_prefill=False, slot_mapping=slots, block_tables=bt, context_lens=(p + 1).int())
             h = self.draft(h, tok, p.clamp(max=self.cfg.max_model_len - 1), meta)
 
+    def dspark_block(self, padded: int):
+        """DSpark: drafts num_spec_tokens tokens per row of the chain buffers. One forward of the draft model gives
+        base logits for a whole block, from the anchor ch_anchor at ch_pos and mask rows after it; then the tokens
+        are drafted one by one, each with the Markov head's term for the token before. Greedy rows take the
+        argmax; the others sample at their temperature and keep the distribution."""
+        bs, g = self.cfg.block_size, self.cfg.num_spec_tokens
+        bt, anchors = self.ch_block_tables[:padded], self.ch_anchor[:padded]
+        pos = (self.ch_pos[:padded, None] + self.blk_offsets).view(-1)
+        slots = bt.gather(1, (pos // bs).view(padded, g)).view(-1).long() * bs + pos % bs
+        meta = AttnMetadata(is_prefill=True, slot_mapping=slots, block_tables=bt, context_lens=(self.ch_pos[:padded] + g).int(),
+                            backend_state=(self.blk_cu[: padded + 1], self.blk_block_m))
+        h = self.draft(anchors, pos.clamp(max=self.cfg.max_model_len - 1), meta)
+        u = self.draft.logits(h).float().view(padded, g, -1)
+        temp = self.ch_temp[:padded]
+        sampled = temp > 0
+        t = torch.where(sampled, temp, 1.0)[:, None]
+        prev = anchors
+        for k in range(g):
+            logits = u[:, k] + self.draft.transition(prev).float()
+            q = torch.softmax(logits / t, dim=-1)
+            pick = torch.where(sampled, (q / torch.empty_like(q).exponential_()).argmax(-1), logits.argmax(-1))
+            prev = self.draft.vocab_ids[pick]
+            self.ch_tokens[:padded, k] = prev
+            self.ch_probs[:padded, k] = q
+
+    @torch.inference_mode()
+    def dspark_next(self, entries):
+        """draft_next for DSpark: one block per sequence. The context K/V are in the pool already (target_forward),
+        so only each block's anchor, position, block table and temperature are needed. After a verify step they
+        come from its buffers and acceptance, on the GPU (block_inputs_kernel); a sequence not in entries gets
+        temperature -1, which makes its block padding. After a prefill or a decode step, the CPU writes them."""
+        seqs = self.last[0]
+        if self.last_verify is not None:
+            n = len(seqs)
+            padded = next(b for b in self.buckets if b >= n)
+            temps = np.full(n, -1.0, np.float32)
+            for i, _ in entries:
+                temps[i] = seqs[i].params.temperature
+            temps = self.to_device(temps, np.float32)
+            block_inputs_kernel[(padded,)](
+                self.mix_pos, self.mix_cu, self.mix_block_tables, self.mix_block_tables.stride(0), self.mix_block_tables.shape[1],
+                self.verify_out, temps, n, self.scratch_block, self.ch_anchor, self.ch_pos, self.ch_temp, self.ch_block_tables,
+                self.ch_block_tables.stride(0), self.ch_block_tables.shape[1],
+                BT_BLOCK=triton.next_power_of_2(self.ch_block_tables.shape[1]))
+            rows = [i for i, _ in entries]
+        else:
+            seqs = [seqs[i] for i, _ in entries]
+            n = len(seqs)
+            padded = next(b for b in self.buckets if b >= n)
+            self.fill_chain_buffers(seqs, padded)
+            rows = list(range(n))
+        if self.use_cuda_graph:
+            self.chain_graphs[padded].replay()
+        else:
+            self.dspark_block(padded)
+        drafts = self.ch_tokens[:n].tolist()
+        probs = None
+        if any(seqs[i].params.temperature > 0 for i in rows):
+            probs = self.ch_probs[:n].clone() if len(rows) == n else self.ch_probs[self.to_device(rows, np.int64)]
+        return [drafts[i] for i in rows], probs
+
     @torch.inference_mode()
     def draft_next(self, entries):
-        """EAGLE drafting after a step. entries is [(i, n)]: sequence i of the last forward continues, and its
-        first n rows there are verified. Returns each sequence's num_spec_tokens drafts, and the distributions
-        they were sampled from ([len(entries), num_spec_tokens, draft vocabulary]; None if all are greedy)."""
+        """Drafting after a step. entries is [(i, n)]: sequence i of the last forward continues, and its first n rows
+        there are verified. Returns each sequence's num_spec_tokens drafts, and the distributions they were
+        sampled from ([len(entries), num_spec_tokens, draft vocabulary]; None if all are greedy)."""
+        if self.spec == "dspark":
+            return self.dspark_next(entries)
         if self.last_verify is not None:
             return self.draft_after_verify(entries)
         seqs, hidden, starts, meta, positions = self.last
@@ -414,7 +506,10 @@ class ModelRunner:
             self.mixed_graphs[padded] = capture(mix, self.mixed_hidden, padded)
         for padded in reversed(self.prefill_buckets):
             self.prefill_graphs[padded] = capture(mix, lambda p: self.mixed_hidden(p, prefill=True), padded)
-        if self.draft is not None:
+        if self.spec == "dspark":
+            for padded in reversed(self.buckets):
+                self.chain_graphs[padded] = capture(self.fill_chain_buffers, self.dspark_block, padded)[0]
+        if self.spec == "eagle":
             for padded in reversed(self.mixed_buckets):
                 self.draft_graphs[padded] = capture(mix, self.draft_hidden, padded)
             for padded in reversed(self.prefill_buckets):
@@ -443,7 +538,7 @@ class ModelRunner:
             hidden = hidden[self.to_device(cu[1:] - 1, np.int64)]
         elif is_prefill:
             input_ids, positions, meta, last = self.prepare_prefill(seqs)
-            hidden = self.model(input_ids, positions, meta)
+            hidden = self.target_forward(input_ids, positions, meta)
             if self.draft is not None:
                 self.last, self.last_verify, self.last_prefill = (seqs, hidden, meta.cu_seqlens[:-1], meta, positions), None, None
             hidden = hidden[last]

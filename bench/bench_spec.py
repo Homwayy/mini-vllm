@@ -18,6 +18,7 @@ Run from the repo root, e.g.:
     python -m bench.bench_spec --out results/e8a_off.json
     python -m bench.bench_spec --spec ngram --num-spec-tokens 4 --out results/e8a_ngram4.json
     python -m bench.bench_spec --spec eagle --num-spec-tokens 4 --out results/e8b_eagle4.json
+    python -m bench.bench_spec --spec dspark --num-spec-tokens 4 --out results/e8c_dspark4.json
 """
 
 import argparse
@@ -78,9 +79,9 @@ def main():
     d = EngineConfig()
     ap = argparse.ArgumentParser()
     ap.add_argument("--workload", default="W4")
-    ap.add_argument("--spec", default=None, help="drafting method, e.g. ngram; off by default")
+    ap.add_argument("--spec", default=None, help="drafting method: ngram, eagle or dspark; off by default")
     ap.add_argument("--num-spec-tokens", type=int, default=d.num_spec_tokens)
-    ap.add_argument("--draft-path", default=d.draft_path, help="the EAGLE draft model")
+    ap.add_argument("--draft-path", default=d.draft_path, help="the draft model (by default checkpoints/gpt2_{spec}.pt)")
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 64])
     ap.add_argument("--requests-c1", type=int, default=32, help="requests run at concurrency 1")
     ap.add_argument("--temperature", type=float, default=None, help="overrides the workload's temperature")

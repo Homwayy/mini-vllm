@@ -1,4 +1,3 @@
-import os
 import time
 from dataclasses import dataclass
 
@@ -31,10 +30,11 @@ class EngineConfig:
     fused_kernels: bool = True  # each layer's elementwise parts in fused Triton kernels (minivllm/fused.py)
     # speculative decoding: up to num_spec_tokens draft tokens per sequence and decode step, which the target
     # model checks all in that step (attention="triton", without prefix caching or chunked prefill). "ngram"
-    # copies them from earlier in the sequence; "eagle" drafts with the model in draft_path (gpt2 only).
+    # copies them from earlier in the sequence; "eagle" and "dspark" draft with the model in draft_path
+    # (gpt2 only; by default checkpoints/gpt2_{spec}.pt).
     spec: str | None = None
     num_spec_tokens: int = 4
-    draft_path: str = os.path.join("checkpoints", "gpt2_eagle.pt")
+    draft_path: str | None = None
     block_size: int = 16
     num_kv_blocks: int = 4096
     max_num_seqs: int = 256
@@ -67,10 +67,10 @@ class LLMEngine:
             raise ValueError("chunked_prefill needs kv='paged', attention='triton' and batching='continuous'")
         if cfg.chunked_prefill and cfg.max_num_batched_tokens < cfg.max_num_seqs:
             raise ValueError("chunked_prefill needs max_num_batched_tokens >= max_num_seqs, so every decode fits")
-        if cfg.spec not in (None, "ngram", "eagle"):
+        if cfg.spec not in (None, "ngram", "eagle", "dspark"):
             raise ValueError(f"unknown spec method {cfg.spec}")
-        if cfg.spec == "eagle" and cfg.model != "gpt2":
-            raise ValueError("the EAGLE draft model is trained for model='gpt2'")
+        if cfg.spec in ("eagle", "dspark") and cfg.model != "gpt2":
+            raise ValueError(f"the {cfg.spec} draft model is trained for model='gpt2'")
         # drafts are checked by the paged prefill kernel, which reads the context from the pool
         if cfg.spec and (cfg.attention != "triton" or cfg.prefix_caching or cfg.chunked_prefill):
             raise ValueError("spec needs attention='triton', and is not combined with prefix caching or chunked prefill")
@@ -79,6 +79,7 @@ class LLMEngine:
         cap_gpu_memory()
         self.runner = ModelRunner(cfg)
         self.proposer = NgramProposer() if cfg.spec == "ngram" else None
+        self.draft_model = cfg.spec in ("eagle", "dspark")  # drafts right after each step, on the GPU
         self.reset()
 
     def reset(self):
@@ -127,7 +128,7 @@ class LLMEngine:
         for seq in seqs:
             seq.num_computed_tokens = len(seq)
         finished = self._append(seqs, tokens, now)
-        if self.cfg.spec == "eagle":  # a prefill: the draft model's prefill, and the first drafts
+        if self.draft_model:  # a prefill: the draft model's prefill (EAGLE), and the first drafts
             self._draft([(i, seq, len(seq) - 1) for i, seq in enumerate(seqs) if seq.status == Status.RUNNING])
             record.end = time.perf_counter()
         self.steps.append(record)
@@ -163,7 +164,7 @@ class LLMEngine:
             self.kv.append(seq, len(d) + self._chain_room(seq, len(d)))
             drafts.append(d)
         probs = None
-        if self.cfg.spec == "eagle" and any(seq.params.temperature > 0 for seq in seqs):
+        if self.draft_model and any(seq.params.temperature > 0 for seq in seqs):
             probs = [seq.draft_probs for seq in seqs]
         start = time.perf_counter()
         tokens = self.runner.run_verify(seqs, drafts, probs)
@@ -179,7 +180,7 @@ class LLMEngine:
             else:
                 seq.num_computed_tokens = len(seq) - 1
                 verified.append((i, seq, len(toks)))  # the rows of its last token and its accepted drafts
-        if self.cfg.spec == "eagle":
+        if self.draft_model:
             self._draft(verified, after_verify=True)
             record.end = time.perf_counter()
         else:
@@ -193,24 +194,29 @@ class LLMEngine:
         return min(self.cfg.num_spec_tokens, seq.params.max_tokens - seq.num_completion_tokens - 1)
 
     def _chain_room(self, seq, num_drafts):
-        """EAGLE drafts right after the verify step, with the blocks seq has in it (ModelRunner.draft_after_verify);
-        the chain writes up to num_spec_tokens - 1 positions past the drafts. Returns how many of those
-        positions to allocate now: all that max_len and the free blocks allow."""
-        if self.cfg.spec != "eagle":
+        """A draft model drafts right after the verify step, with the blocks seq has in it: EAGLE's chain writes up
+        to num_spec_tokens - 1 positions past the drafts (ModelRunner.draft_after_verify), a DSpark block up to
+        num_spec_tokens (ModelRunner.dspark_next). Returns how many of those positions to allocate now: all that
+        max_len and the free blocks allow."""
+        if not self.draft_model:
             return 0
-        extra = max(0, min(self.cfg.num_spec_tokens - 1, seq.max_len - len(seq) - num_drafts))
+        reach = self.cfg.num_spec_tokens - (self.cfg.spec == "eagle")
+        extra = max(0, min(reach, seq.max_len - len(seq) - num_drafts))
         while extra and not self.kv.can_append(seq, num_drafts + extra):
             extra -= 1
         return extra
 
     def _draft(self, entries, after_verify=False):
-        """EAGLE: entries is [(row of the sequence in this step, sequence, number of its verified rows)]. Catches
-        the draft model up on those rows and drafts the sequences' next tokens, with blocks reserved for them."""
+        """A draft model: entries is [(row of the sequence in this step, sequence, number of its verified rows)].
+        Catches the draft model up on those rows (EAGLE) and drafts the sequences' next tokens, with blocks
+        reserved for them."""
         keep = []
         for i, seq, n in entries:
             k = self._max_drafts(seq)
-            if after_verify:  # draft m reads the chain's K/V up to position len(seq) + m - 3, in the step's blocks
-                k = min(k, len(seq.block_table) * self.cfg.block_size - len(seq) + 2)
+            if after_verify:
+                # draft m reads K/V the drafting wrote, up to position len(seq) + m - 3 (EAGLE's chain) or
+                # len(seq) + m - 2 (a DSpark block), in the step's blocks
+                k = min(k, len(seq.block_table) * self.cfg.block_size - len(seq) + 1 + (self.cfg.spec == "eagle"))
             while k > 0 and not self.kv.can_append(seq, k):
                 k -= 1
             self.kv.truncate(seq, k)

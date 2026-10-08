@@ -89,8 +89,8 @@ def instrument(engine, timer):
     draft_next = runner.draft_next
 
     def recorded_draft_next(entries):
-        # after a decode or verify step: a catch-up over the verified rows (after a prefill, the draft's prefill)
-        if runner.last[3] is None and runner.last_prefill is None:
+        # EAGLE, after a decode or verify step: a catch-up over the verified rows (DSpark has none)
+        if runner.spec == "eagle" and runner.last[3] is None and runner.last_prefill is None:
             rows = sum(n for _, n in entries)
             # after a verify step, it runs over the verify step's padded rows (ModelRunner.draft_after_verify)
             padded = runner.last_verify or bucket(runner.mixed_buckets, rows)
@@ -180,7 +180,7 @@ def main():
     d = EngineConfig()
     ap = argparse.ArgumentParser()
     ap.add_argument("--workload", default="W4")
-    ap.add_argument("--spec", default=None, help="drafting method, ngram or eagle; off by default")
+    ap.add_argument("--spec", default=None, help="drafting method: ngram, eagle or dspark; off by default")
     ap.add_argument("--num-spec-tokens", type=int, default=d.num_spec_tokens)
     ap.add_argument("--draft-path", default=d.draft_path)
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 8, 32, 64])
