@@ -89,7 +89,8 @@ def instrument(engine, timer):
     draft_next = runner.draft_next
 
     def recorded_draft_next(entries):
-        if runner.last[3] is None:  # after a decode or verify step: a catch-up over the verified rows
+        # after a decode or verify step: a catch-up over the verified rows (after a prefill, the draft's prefill)
+        if runner.last[3] is None and runner.last_prefill is None:
             rows = sum(n for _, n in entries)
             # after a verify step, it runs over the verify step's padded rows (ModelRunner.draft_after_verify)
             padded = runner.last_verify or bucket(runner.mixed_buckets, rows)
@@ -106,7 +107,8 @@ def instrument(engine, timer):
     timer.wrap(runner, "fill_mixed_buffers", ".fill")
     timer.wrap(runner, "fill_chain_buffers", "draft.chain_fill")
     for graphs, part in ((runner.graphs, "target.forward"), (runner.mixed_graphs, "target.forward"),
-                         (runner.draft_graphs, "draft.catchup")):
+                         (runner.prefill_graphs, "target.forward"), (runner.draft_graphs, "draft.catchup"),
+                         (runner.draft_prefill_graphs, "draft.catchup")):
         for k, (g, out) in graphs.items():
             graphs[k] = (TimedGraph(timer, part, g), out)
     for k, g in runner.chain_graphs.items():
@@ -187,6 +189,7 @@ def main():
     ap.add_argument("--detail", action="store_true", help="also run each level with synchronized sub-parts")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--no-fused-kernels", action="store_true", help="run each layer's elementwise ops one PyTorch kernel at a time")
+    ap.add_argument("--prefill-graph-tokens", type=int, default=d.prefill_graph_tokens, help="largest prefill step replayed as a CUDA graph; 0: all eager")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -195,6 +198,7 @@ def main():
     cfg = EngineConfig(
         model=w.get("model", "gpt2"), max_model_len=1024, max_num_seqs=max(args.concurrency), spec=args.spec,
         num_spec_tokens=args.num_spec_tokens, draft_path=args.draft_path, fused_kernels=not args.no_fused_kernels,
+        prefill_graph_tokens=args.prefill_graph_tokens,
     )
     engine = LLMEngine(cfg)
     engine.warmup(temperature)

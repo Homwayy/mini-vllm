@@ -90,6 +90,7 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=d.max_model_len)
     ap.add_argument("--no-cuda-graph", action="store_true")
     ap.add_argument("--no-fused-kernels", action="store_true", help="run each layer's elementwise ops one PyTorch kernel at a time")
+    ap.add_argument("--prefill-graph-tokens", type=int, default=d.prefill_graph_tokens, help="largest prefill step replayed as a CUDA graph; 0: all eager")
     ap.add_argument("--runs", type=int, default=3)
     ap.add_argument("--limit", type=int, default=0, help="use only the first N requests (smoke tests)")
     ap.add_argument("--seed", type=int, default=0)
@@ -101,7 +102,7 @@ def main():
         prefix_caching=args.prefix_caching, chunked_prefill=args.chunked_prefill,
         num_kv_blocks=args.num_kv_blocks, max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens, max_model_len=args.max_model_len,
-        cuda_graph=not args.no_cuda_graph, fused_kernels=not args.no_fused_kernels,
+        cuda_graph=not args.no_cuda_graph, fused_kernels=not args.no_fused_kernels, prefill_graph_tokens=args.prefill_graph_tokens,
     )
     w = load_workload(args.workload)
     reqs = w["requests"][: args.limit or None]

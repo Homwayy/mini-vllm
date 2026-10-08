@@ -7,7 +7,8 @@ the reference argmax up to bf16 noise. A KV bookkeeping error (a wrong slot, blo
 after preemption) produces tokens far from the argmax.
 
 Decode runs in CUDA graphs. Replaying a graph runs the same kernels on the same padded shapes as the eager
-path, so for each policy the eager engine must produce exactly the same tokens.
+path, so for each policy the eager engine must produce exactly the same tokens. Prefill steps of up to
+prefill_graph_tokens tokens are padded and run in CUDA graphs too; larger ones, such as the first, run eagerly.
 
 Prefix caching runs on prompts built from a few shared prefixes: one of exactly 3 blocks (so some prompts
 are entirely cached and their last block is computed again), one of 6 blocks and 4 tokens, and one shorter

@@ -10,6 +10,10 @@ a token-count bucket instead. Its sequences sit in a fixed number of slots: the 
 more sequence that reads and writes only the scratch block, and unused slots have no tokens. The prefill
 kernel then runs with a grid that depends only on the bucket, so mixed steps are captured as well.
 
+Without chunked prefill, a prefill step of at most prefill_graph_tokens tokens takes the same layout, padded
+to its own token buckets with prefill-sized tiles, and is captured too: eager, such a step is bound by
+launching its kernels. Longer prefill steps run eagerly, unpadded.
+
 With speculative decoding, a decode step that checks draft tokens (a verify step) is a mixed step too: each
 sequence computes its last token and its drafts, so a sequence without drafts adds a single row.
 
@@ -17,7 +21,7 @@ With EAGLE drafting, after every step the draft model first catches up on the po
 verified (again a mixed step, over the draft's own KV pool), then drafts num_spec_tokens tokens per sequence
 in a chain of single-row steps; both are captured as CUDA graphs. After a verify step, both take their
 inputs from the verify step's buffers and acceptance on the GPU. After a prefill, the catch-up is the
-draft's prefill over the prompt, with the target's prefill layout.
+draft's prefill over the prompt, with the target's prefill layout (in its buffers, if padded).
 """
 
 import itertools
@@ -63,6 +67,12 @@ def mixed_buckets(max_tokens, smallest=64):
     return sizes + [max_tokens]
 
 
+def prefill_buckets(max_tokens):
+    # finer than powers of 2: a padded token costs a bit of GPU time, while a graph saves launch time per kernel
+    sizes = [b for b in (16, 32) if b < max_tokens] + list(range(64, max_tokens, 64))
+    return sizes + [max_tokens]
+
+
 class ModelRunner:
     def __init__(self, cfg, device="cuda"):
         self.cfg = cfg
@@ -104,16 +114,21 @@ class ModelRunner:
         self.dec_block_tables = torch.zeros(n, w, dtype=torch.int32, device=device)
         self.dec_context_lens = torch.zeros(n, dtype=torch.int32, device=device)
         self.graphs = {}  # bucket -> (CUDAGraph, hidden-state output)
+        self.group_pad = triton.next_power_of_2(self.model.attn_layers[0].num_heads // self.model.num_kv_heads)
         # mixed steps: prompt chunks with decode rows, or (speculative decoding) decode rows with their drafts
         self.mixed_buckets, self.mixed_block_m = [], MIXED_BLOCK_M
         if cfg.chunked_prefill:
             self.mixed_buckets = mixed_buckets(cfg.max_num_batched_tokens)
         elif cfg.spec:
             self.mixed_buckets = mixed_buckets(cfg.max_num_seqs * (cfg.num_spec_tokens + 1), smallest=8)
-            group = self.model.attn_layers[0].num_heads // self.model.num_kv_heads
-            self.mixed_block_m = prefill_block_m(cfg.num_spec_tokens + 1, triton.next_power_of_2(group))
-        if self.mixed_buckets:
-            t, n = self.mixed_buckets[-1], cfg.max_num_seqs + 1  # one more slot for the padding tokens
+            self.mixed_block_m = prefill_block_m(cfg.num_spec_tokens + 1, self.group_pad)
+        # short prefill steps in the same buffers (chunked prefill has every prompt in mixed steps already)
+        self.prefill_buckets = []
+        if cfg.prefill_graph_tokens > 0 and cfg.attention == "triton" and not cfg.chunked_prefill:
+            self.prefill_buckets = prefill_buckets(min(cfg.prefill_graph_tokens, cfg.max_num_batched_tokens))
+        self.prefill_graphs = {}  # token bucket -> (CUDAGraph, hidden-state output)
+        if self.mixed_buckets or self.prefill_buckets:
+            t, n = max(self.mixed_buckets[-1:] + self.prefill_buckets[-1:]), cfg.max_num_seqs + 1  # one more slot for the padding tokens
             self.mix_ids = torch.zeros(t, dtype=torch.int64, device=device)
             self.mix_pos = torch.zeros(t, dtype=torch.int64, device=device)
             self.mix_slots = torch.zeros(t, dtype=torch.int64, device=device)
@@ -127,9 +142,11 @@ class ModelRunner:
         # target position t), and the static buffers of its catch-up and drafting steps
         self.draft = None
         self.draft_graphs = {}  # token bucket -> (CUDAGraph, draft output) for catching up
+        self.draft_prefill_graphs = {}  # prefill token bucket -> (CUDAGraph, draft output)
         self.chain_graphs = {}  # batch bucket -> CUDAGraph that drafts num_spec_tokens tokens
         self.last = None  # the last forward, for drafting: (sequences, hidden states, first row of each, prefill meta and positions)
         self.last_verify = None  # the token bucket of the last forward if it was a verify step
+        self.last_prefill = None  # the token bucket of the last forward if it was a padded prefill step
         if cfg.spec == "eagle":
             self.draft = load_eagle(cfg.draft_path, self.model, attn, device)
             self.draft.fused = cfg.fused_kernels
@@ -138,7 +155,7 @@ class ModelRunner:
             a.v_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
             self.kv_bytes += 2 * a.k_cache.numel() * a.k_cache.element_size()
             d, s, g = self.model.cfg.n_embd, self.buckets[-1], cfg.num_spec_tokens
-            self.mix_feat = torch.zeros(self.mixed_buckets[-1], d, dtype=torch.float32, device=device)
+            self.mix_feat = torch.zeros(self.mix_ids.shape[0], d, dtype=torch.float32, device=device)
             self.ch_g = torch.zeros(s, d, dtype=torch.float32, device=device)
             self.ch_pos = torch.zeros(s, dtype=torch.int64, device=device)
             self.ch_temp = torch.zeros(s, dtype=torch.float32, device=device)
@@ -234,20 +251,20 @@ class ModelRunner:
             buf.copy_(torch.from_numpy(x))
         return cu[: k + 1]
 
-    def mixed_hidden(self, padded: int):
-        meta = AttnMetadata(
+    def mixed_meta(self, padded: int, prefill: bool):
+        # a padded prefill step has eager prefill's tiles (prefill_block_m); a mixed step keeps them small
+        block_m = prefill_block_m(padded, self.group_pad) if prefill else self.mixed_block_m
+        return AttnMetadata(
             is_prefill=True, slot_mapping=self.mix_slots[:padded], block_tables=self.mix_block_tables,
-            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, self.mixed_block_m),
+            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, block_m),
         )
-        return self.model(self.mix_ids[:padded], self.mix_pos[:padded], meta)
 
-    def draft_hidden(self, padded: int):
+    def mixed_hidden(self, padded: int, prefill=False):
+        return self.model(self.mix_ids[:padded], self.mix_pos[:padded], self.mixed_meta(padded, prefill))
+
+    def draft_hidden(self, padded: int, prefill=False):
         """The draft model over a mixed step in the static buffers, with features from mix_feat."""
-        meta = AttnMetadata(
-            is_prefill=True, slot_mapping=self.mix_slots[:padded], block_tables=self.mix_block_tables,
-            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, self.mixed_block_m),
-        )
-        return self.draft(self.mix_feat[:padded], self.mix_ids[:padded], self.mix_pos[:padded], meta)
+        return self.draft(self.mix_feat[:padded], self.mix_ids[:padded], self.mix_pos[:padded], self.mixed_meta(padded, prefill))
 
     def fill_chain_buffers(self, seqs: list[Sequence], padded: int):
         """Writes where each sequence's draft chain starts: its last position, block table and temperature."""
@@ -290,7 +307,19 @@ class ModelRunner:
         if self.last_verify is not None:
             return self.draft_after_verify(entries)
         seqs, hidden, starts, meta, positions = self.last
-        if meta is not None:  # after a prefill: the draft's prefill, over every prompt position
+        if self.last_prefill is not None:  # after a padded prefill: the draft's prefill in the same buffers
+            padded = self.last_prefill
+            # the row of position p takes token p + 1; the step has appended each sequence's next token
+            ids = list(itertools.chain.from_iterable(seq.token_ids[seq.num_cached_tokens + 1 :] for seq in seqs))
+            self.mix_ids[: len(ids)].copy_(torch.tensor(ids))
+            self.mix_feat[:padded].copy_(hidden[:padded])
+            if self.use_cuda_graph:
+                graph, out = self.draft_prefill_graphs[padded]
+                graph.replay()
+            else:
+                out = self.draft_hidden(padded, prefill=True)
+            last_rows = [starts[i] + n - 1 for i, n in entries]
+        elif meta is not None:  # after an eager prefill: the draft's prefill, over every prompt position
             cu = meta.cu_seqlens
             ids = itertools.chain.from_iterable(seq.token_ids[1 : 1 + b - a] for seq, a, b in zip(seqs, cu[:-1], cu[1:]))
             out = self.draft(hidden, self.to_device(list(ids), np.int64), positions, meta)
@@ -364,51 +393,34 @@ class ModelRunner:
         max_len = self.cfg.max_model_len  # graphs need a fixed shape for the gather backend's padding
         pool = torch.cuda.graph_pool_handle()
         stream = torch.cuda.Stream()
+
+        def capture(fill, forward, padded):
+            fill([], padded)
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(2):  # compiles flex for this shape before capturing
+                    forward(padded)
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool, stream=stream):
+                out = forward(padded)
+            return graph, out
+
+        mix = self.fill_mixed_buffers
         # largest bucket first, so the smaller graphs reuse its memory
         for padded in reversed(self.buckets):
-            self.fill_decode_buffers([], padded)
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):  # compiles flex for this batch size before capturing
-                    self.decode_hidden(padded, max_len)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=stream):
-                hidden = self.decode_hidden(padded, max_len)
-            self.graphs[padded] = (graph, hidden)
+            self.graphs[padded] = capture(self.fill_decode_buffers, lambda p: self.decode_hidden(p, max_len), padded)
         for padded in reversed(self.mixed_buckets):
-            self.fill_mixed_buffers([], padded)
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    self.mixed_hidden(padded)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=stream):
-                hidden = self.mixed_hidden(padded)
-            self.mixed_graphs[padded] = (graph, hidden)
-        for padded in reversed(self.mixed_buckets) if self.draft is not None else ():
-            self.fill_mixed_buffers([], padded)
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    self.draft_hidden(padded)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=stream):
-                out = self.draft_hidden(padded)
-            self.draft_graphs[padded] = (graph, out)
-        for padded in reversed(self.buckets) if self.draft is not None else ():
-            self.fill_chain_buffers([], padded)
-            stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(stream):
-                for _ in range(2):
-                    self.draft_chain(padded)
-            torch.cuda.current_stream().wait_stream(stream)
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool, stream=stream):
-                self.draft_chain(padded)
-            self.chain_graphs[padded] = graph
+            self.mixed_graphs[padded] = capture(mix, self.mixed_hidden, padded)
+        for padded in reversed(self.prefill_buckets):
+            self.prefill_graphs[padded] = capture(mix, lambda p: self.mixed_hidden(p, prefill=True), padded)
+        if self.draft is not None:
+            for padded in reversed(self.mixed_buckets):
+                self.draft_graphs[padded] = capture(mix, self.draft_hidden, padded)
+            for padded in reversed(self.prefill_buckets):
+                self.draft_prefill_graphs[padded] = capture(mix, lambda p: self.draft_hidden(p, prefill=True), padded)
+            for padded in reversed(self.buckets):
+                self.chain_graphs[padded] = capture(self.fill_chain_buffers, self.draft_chain, padded)[0]
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         self.graph_capture_s = time.perf_counter() - start
@@ -417,11 +429,23 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
-        if is_prefill:
+        num_new = sum(len(seq) - seq.num_cached_tokens for seq in seqs) if is_prefill else 0
+        if is_prefill and self.prefill_buckets and num_new <= self.prefill_buckets[-1]:
+            padded = next(b for b in self.prefill_buckets if b >= num_new)
+            cu = self.fill_mixed_buffers([(seq, seq.num_cached_tokens, seq.token_ids[seq.num_cached_tokens :]) for seq in seqs], padded)
+            if self.use_cuda_graph:
+                graph, hidden = self.prefill_graphs[padded]
+                graph.replay()
+            else:
+                hidden = self.mixed_hidden(padded, prefill=True)
+            if self.draft is not None:
+                self.last, self.last_verify, self.last_prefill = (seqs, hidden, cu[:-1].tolist(), None, None), None, padded
+            hidden = hidden[self.to_device(cu[1:] - 1, np.int64)]
+        elif is_prefill:
             input_ids, positions, meta, last = self.prepare_prefill(seqs)
             hidden = self.model(input_ids, positions, meta)
             if self.draft is not None:
-                self.last, self.last_verify = (seqs, hidden, meta.cu_seqlens[:-1], meta, positions), None
+                self.last, self.last_verify, self.last_prefill = (seqs, hidden, meta.cu_seqlens[:-1], meta, positions), None, None
             hidden = hidden[last]
         else:
             padded = next(b for b in self.buckets if b >= len(seqs))
@@ -433,7 +457,7 @@ class ModelRunner:
                 hidden = self.decode_hidden(padded, max_context_len)
             hidden = hidden[: len(seqs)]
             if self.draft is not None:
-                self.last, self.last_verify = (seqs, hidden, list(range(len(seqs))), None, None), None
+                self.last, self.last_verify, self.last_prefill = (seqs, hidden, list(range(len(seqs))), None, None), None, None
         logits = self.model.compute_logits(hidden)
         return self.sampler(logits, [seq.params for seq in seqs]).tolist()
 
@@ -468,7 +492,7 @@ class ModelRunner:
         self.fill_mixed_buffers([(seq, len(seq) - 1, [seq.token_ids[-1]] + d) for seq, d in zip(seqs, drafts)], padded)
         hidden = self.mixed_forward(padded)
         if self.draft is not None:
-            self.last, self.last_verify = (seqs, hidden, None, None, None), padded
+            self.last, self.last_verify, self.last_prefill = (seqs, hidden, None, None, None), padded, None
         logits = self.model.compute_logits(hidden[:t])
         q, vocab = None, None
         if draft_probs is not None:
