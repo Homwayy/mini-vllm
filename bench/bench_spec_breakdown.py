@@ -16,6 +16,7 @@ target and draft further (the synchronizations make that run slightly slower):
   fill: writing the step's inputs into the static buffers; forward: the target model's graph;
   catchup: the draft model's graph over the verified positions; chain_fill, chain: the inputs and the graph
   of the drafting chain; rest: everything else (logits, sampling and acceptance, gathers, copies to the CPU).
+  After a verify step, EAGLE builds its inputs in one kernel instead of fills, which counts as draft.rest.
 
 Run from the repo root, e.g.:
     python -m bench.bench_spec_breakdown --spec eagle --detail --out results/e8b_breakdown_greedy_eagle4.json
@@ -90,7 +91,9 @@ def instrument(engine, timer):
     def recorded_draft_next(entries):
         if runner.last[3] is None:  # after a decode or verify step: a catch-up over the verified rows
             rows = sum(n for _, n in entries)
-            catchups.append((rows, bucket(runner.mixed_buckets, rows)))
+            # after a verify step, it runs over the verify step's padded rows (ModelRunner.draft_after_verify)
+            padded = runner.last_verify or bucket(runner.mixed_buckets, rows)
+            catchups.append((rows, padded))
         return draft_next(entries)
 
     runner.draft_next = recorded_draft_next
