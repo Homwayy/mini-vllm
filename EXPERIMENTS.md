@@ -2,7 +2,7 @@
 
 从零写一个小型 LLM 推理引擎（mini vLLM），在一张 12 GB 的笔记本 GPU 上服务 Qwen3-0.6B，逐项对比 KV cache 的管理方式、调度策略和注意力实现对吞吐和延迟的影响。
 
-目前完成了 E0（正确性）到 E7，以及 E8a、E8b、E8b.1、E8b.2。在固定的离线负载 W1（256 条请求）上：
+目前完成了 E0（正确性）到 E7，E8a、E8b、E8b.1、E8b.2，以及 E9。在固定的离线负载 W1（256 条请求）上：
 
 - **E1（基线）：** 静态批处理的起点是 1760 输出 token/s，是 HF transformers 静态批处理（160 token/s）的 11.0 倍；但 KV 池里平均只有 26.2% 的槽位存着 token。
 - **E2（分页 KV）：** KV 改成分页以后，KV 利用率从 52% 提高到 99%，同一批能放的序列从 32 条提高到最多 60 条，吞吐提高 24.9%，到 2204 token/s。提升受限于静态批处理的尾部：每批都要等其中最长的请求。
@@ -15,6 +15,9 @@
   - 单层 prefill 是 flex 的 1.9–2.5 倍，16 × 1024 时 47.6 TFLOPS，为矩阵乘峰值的 78%。
   - prefill 注意力只占 W1 总时间的约 1%，所以吞吐只多 0.49%。
 - **E5（CUDA graph）：** 只关掉 decode 的 CUDA graph，W1 的吞吐降到 1484 token/s（−44%），batch 1 时每步从 5.0 ms 变成 31.2 ms：不录图时，CPU 逐个提交 kernel 的时间比 GPU 计算的时间还长。
+- **E9（融合逐元素的 kernel）：** 每层的 norm、RoPE、写 KV、残差相加和 SiLU × up 合成 5 个 Triton kernel，Qwen3 的 decode 图从 1525 个 kernel 降到 282 个，每步省 1.5–2.1 ms。
+  - W1 的吞吐提高 18.2%，到 3200 token/s：decode 步快 12.7%，不录图的 prefill 步快 36%。
+  - 大 prefill 时，原来每个小运算都要读写一遍整个激活，它们的 GPU 时间比全部矩阵乘还长（单独检查：一步 14,400 个 token 时 314–331 对 214–229 ms）。
 
 在 64 条请求共用一段 1000 个 token 前缀的负载 W3 上：
 
@@ -46,6 +49,9 @@
   - W4 上 EAGLE 的吞吐再提高 14–19%。和不投机相比，并发 1–64 的收益从 6–28% 提高到 24–54%。
 - **E8b.2（起草的输入在 GPU 上准备）：** 验证步之后，补算和起草链的输入由一个 kernel 从验证步的缓冲区和接受结果算出来，CPU 不再给起草写缓冲区。
   - 起草每步少 0.29–0.43 ms。temperature 1.0 下 EAGLE 的吞吐再提高 3–10%；和不投机相比，并发 1–64 的收益到 26–67%。
+- **E9 在 W4 上：** 不投机快 31–39%，EAGLE 快 28–33%。
+  - W4 的 prefill 步大多只有一条短 prompt，不录图，时间主要花在 CPU 提交 kernel 上；kernel 少了以后，每步快了约一倍。并发 32、64 时，省下的总时间有 44–63% 在 prefill。
+  - 不投机变快得更多，EAGLE 相对不投机的收益略降到 +23–60%（每个并发取最好的 γ）。
 
 详见第 2 节。
 
@@ -55,7 +61,8 @@
   - E0：[tests/test_qwen3_hf.py](tests/test_qwen3_hf.py)、[tests/test_gpt2_nanogpt.py](tests/test_gpt2_nanogpt.py)。
   - W1 的吞吐：[bench/bench_offline.py](bench/bench_offline.py)；E1 里 HF 的那组用 [bench/bench_hf.py](bench/bench_hf.py)。
   - W2 的延迟：[bench/bench_online.py](bench/bench_online.py)。
-  - E4 的单层注意力和单步 decode：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)；E7 的单步耗时：[bench/bench_mixed_step.py](bench/bench_mixed_step.py)。
+  - E4 的单层注意力和单步 decode（E5、E9 也用它）：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)；E7 的单步耗时：[bench/bench_mixed_step.py](bench/bench_mixed_step.py)。
+  - E9 的图里的 kernel：[bench/bench_kernels.py](bench/bench_kernels.py)；融合 kernel 的逐个检查：[tests/test_fused.py](tests/test_fused.py)；E0 的两个脚本加 `--fused` 测融合以后的误差。
   - E8 的投机解码：[bench/bench_spec.py](bench/bench_spec.py)，每步时间的拆解：[bench/bench_spec_breakdown.py](bench/bench_spec_breakdown.py)，E8b.1 的接受判断单独测：[bench/bench_verify.py](bench/bench_verify.py)；E8b 草稿模型的训练和离线接受率：[train_draft.py](train_draft.py)；E8a、E8b 的正确性：[tests/test_spec.py](tests/test_spec.py)、[tests/test_engine.py](tests/test_engine.py)。
 - 负载文件在 [bench/workloads/](bench/workloads/)，由 [bench/workloads.py](bench/workloads.py) 用固定的 seed 生成。
 - 第 3 节记录实现上的设计决策。其中的数字除了注明来自 results/ 的，都来自单独的检查脚本（没有放进仓库），只用来说明设计的原因；需要作为结论的数字，会在后面的实验里正式测量。
@@ -96,6 +103,7 @@
   - `prefix_caching=True`：前缀缓存，序列之间共享内容相同的整块 KV（见 E6、3.7）。只能和 `kv=paged`、`attention=triton` 一起用。
   - `chunked_prefill=True`：分块 prefill，每步最多算 `max_num_batched_tokens` 个 token，prompt 可以分几步算完，和 decode 放在同一步里（见 E7、3.8）。只能和 `kv=paged`、`attention=triton`、`batching=continuous` 一起用。
   - `spec="ngram"` 或 `spec="eagle"`：投机解码，每个 decode 步里每条序列最多验证 `num_spec_tokens` 个草稿 token。ngram 从前文照抄草稿（见 E8a、3.9）；eagle 用训练出来的草稿模型起草，只用于 GPT-2（见 E8b、3.10）。只能和 `attention=triton` 一起用，暂不和前缀缓存、分块 prefill 一起用。
+  - `fused_kernels=True`（默认）：每层逐元素的部分用 [minivllm/fused.py](minivllm/fused.py) 里融合的 Triton kernel（见 E9、3.11）。E1–E8 用的都是 `False` 时的写法，那时还没有这些 kernel。
 - **其他固定设置：** 不分块时，每一步要么全是 prefill，要么全是 decode，prefill 每步最多 16,384 个 token；最多同时运行 256 条序列；max_model_len 2048。
 - **注意力：** 三种实现，用 `attention` 切换：
   - `attention=flex`：FlexAttention。prefill 一次处理打平的多条序列（document mask），decode 按 block table 直接读 KV 池，见 3.1。E1–E3 用它。
@@ -152,12 +160,13 @@
 | E2 | 2026-10-07 | `2716a20` | `kv=paged`，`admission=reserve`，`batching=static` | 2204 token/s（对照组 1765） | 31.9 / 60 | 0.992 | 0.435 | 8.61 GiB |
 | E3 | 2026-10-07 | `4089c27` | `kv=paged`，`admission=reserve`，`batching=continuous` | 2605 token/s（对照组 2246、2270） | 46.0 / 60 | 0.992 | 0.644 | 8.61 GiB |
 | E3b | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=optimistic` | 2571、2575 token/s（对照组 2620、2609） | 62.5 / 116 | 0.992 | 0.862 | 8.61 GiB |
-| E3c | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=headroom` | **2719 token/s**（对照组 2571、2575） | 61.9 / 113 | 0.992 | 0.854 | 8.61 GiB |
+| E3c | 2026-10-07 | `eae8d4b` | E3 的配置，`admission=headroom` | 2719 token/s（对照组 2571、2575） | 61.9 / 113 | 0.992 | 0.854 | 8.61 GiB |
 | E4 | 2026-10-07 | `dc8c94d` | E3 的配置，`attention=triton-decode`（当时叫 `triton`） | 2587 token/s（对照组 2555、2557） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
 | E4b | 2026-10-07 | `c8b920b` | E4 的配置，`attention=triton`（prefill 也用 Triton） | 2704 token/s（对照组 2691、2690） | 46.7 / 60 | 0.992 | 0.653 | 8.63 GiB |
 | E5 | 2026-10-07 | `b7c38b4` | E4b 的配置，`cuda_graph=False`（decode 不录图） | 1484 token/s（对照组 2656、2682） | 43.9 / 60 | 0.992 | 0.614 | 8.62 GiB |
 | E6 | 2026-10-07 | `995c15c` | E4b 的配置，`prefix_caching=True`；W1 上没有可共享的前缀，W3 见 E6 | 2708 token/s（对照组 2711、2712） | 46.7 / 60 | 0.992 | 0.652 | 8.63 GiB |
 | E7 | 2026-10-07 | `32ff87b` | E4b 的配置，`chunked_prefill=True`，每步最多 1024 个 token；W2 见 E7 | 2712 token/s（对照组 2711、2645） | 46.5 / 60 | 0.992 | 0.649 | 8.28 GiB |
+| E9 | 2026-10-08 | `3b6e574` | E4b 的配置，`fused_kernels=True`（融合逐元素的 kernel） | **3200 token/s**（对照组 2703、2712） | 47.1 / 60 | 0.992 | 0.658 | 8.59 GiB |
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
@@ -180,6 +189,7 @@
 | 我们的模型，flex 注意力 | 0.037–0.049 | 0.035–0.043 | 0.19 / 0.085 |
 | 我们的模型，Triton 注意力，只换 decode（`triton-decode`） | 0.037–0.049 | 0.035–0.048 | 0.19 / 0.085 |
 | 我们的模型，Triton 注意力，prefill 和 decode（`triton`） | 0.037–0.049 | 0.033–0.047 | 0.19 / 0.12 |
+| 我们的模型，Triton 注意力，融合的 kernel（`triton`，`--fused`，E9） | 0.037–0.048 | 0.034–0.040 | 0.19 / 0.085 |
 | HF 的 bf16 模型 | 0.036–0.049 | 0.032–0.042 | 0.19 / 0.10 |
 
 - **误差和 HF 自己的 bf16 同一水平。** 单个位置的最大误差偶尔超过 1，HF 的 bf16 也一样（最大 1.66），所以看平均误差和遗憾值。
@@ -190,6 +200,7 @@
 - **贪心生成不是逐 token 一致：**
   - 和 HF 的 bf16 相比，分歧出现在第 1–33 个 token。flex 和 Triton 注意力下，都有同一条 prompt 的 64 个 token 完全相同。
   - 每个分歧处，HF 自己 top-2 的 logits 差距都是 0 或 0.125，也就是两个候选在 bf16 下打平了（logit 在 16–32 之间时，bf16 能表示的最小间隔是 0.125）。两边的 kernel 不同，打平时就会选不同的 token。
+- **融合的 kernel（E9）：** 误差和不融合时同一水平；在这次生成的序列上，HF 的 bf16 decode 误差是 0.034–0.041，最大遗憾值 0.11。分歧的位置：17、517、1000 个 token 的三条和不融合时相同（第 3、6、7 个 token）；120 个 token 的那条原来 64 个 token 全部相同，现在在第 1 个 token 分岔，那里 HF 自己 top-2 的差距是 0。
 
 **GPT-2 和 nanoGPT 对比：**
 
@@ -202,6 +213,9 @@
   - `triton-decode`：decode 相对 fp32 的平均误差是 0.0090–0.0095，nanoGPT 在同样的序列上是 0.0086–0.0091。
   - `triton`：prefill 是 0.0081–0.0087（nanoGPT 0.0082–0.0087），decode 是 0.0089–0.0094。
   - 两种配置下，打包和单独跑时，都是 4 条中有 3 条的 128 个 token 和 nanoGPT 相同。
+- **融合的 kernel（`--fused`，E9）：**
+  - gather 注意力：LayerNorm 的求和顺序变了，prefill 不再和 nanoGPT 逐位相同，平均差 0.004–0.006。贪心生成和不融合时一样：单独跑时 4 条全部相同，打包时 17 个 token 的那条在同一个位置分岔。
+  - `triton`：相对 fp32 的平均误差，prefill 是 0.0082–0.0087（nanoGPT 0.0082–0.0087），decode 是 0.0090–0.0095（nanoGPT 0.0086–0.0091）。打包时 4 条中有 3 条的 128 个 token 和 nanoGPT 相同，单独跑时 4 条都相同。
 
 **批不变性：** 上面 17 个 token 那条单独跑时和 nanoGPT 逐位相同，和别的序列打包以后就不同了。打包后矩阵乘法从 17 行变成 1550 行，cuBLAS 选了不同的 kernel，累加顺序随之改变。在连续批处理的引擎里，同一条请求的输出会随同一批里的其他请求变化；这在贪心解码下表现为偶尔在打平的位置分岔。
 
@@ -1149,6 +1163,134 @@
 
 **结论：** 验证步之后，补算和起草链的输入改由一个 kernel 在 GPU 上写好，起草每步少 0.29–0.43 ms，省下的正是 CPU 写缓冲区的时间。temperature 1.0 下 EAGLE 每步快 0.2–0.5 ms，吞吐提高 3–10%；和不投机相比，并发 1–64 的收益从 E8b.1 的 24–54% 提高到 26–67%。贪心每步快 0.27–0.31 ms。现在起草几乎只剩两个图本身（并发 1 时 0.96 ms 里的 0.71 ms），下一步要减少起草链的 kernel 数；其次是并发 32 时验证步的补齐，补算现在也跟着补到同一个桶。
 
+### E9：融合逐元素的 kernel（Qwen3、GPT-2）
+
+- **动机：** CUDA graph 省掉了 CPU 逐个提交 kernel 的时间（E5），但图里每个 kernel 在 GPU 上仍有固定的开销。用 profiler 看改动前的 decode 图（[bench/bench_kernels.py](bench/bench_kernels.py)，测了两次）：
+  - Qwen3 的 decode 步（batch 1）有 1525 个 kernel，其中 1357 个不是矩阵乘也不是注意力，而是逐元素运算、norm、拷贝、类型转换和索引，GPU 时间 1.59–1.71 ms，和全部矩阵乘（1.80–1.95 ms）差不多。平均每层 48 个。
+  - GPT-2 是 424 个，其中这类 kernel 352 个、0.44–0.45 ms（矩阵乘 0.49–0.50 ms）。EAGLE 的补算和起草链也一样（3.10）。
+  - 它们来自模型参照写法里一串串的 PyTorch 小运算：Qwen3 的一次 RMSNorm 就是 8 个 kernel，每层 4 次（两次对整个 hidden，q、k 各一次按头）；GPT-2 的 RoPE 对 q、k 各 10 个。batch 1 时每个只读写几 KiB，耗时是固定的 1–2 µs；prefill 时每个都要读写一遍整个激活。
+- **改动：** [minivllm/fused.py](minivllm/fused.py) 里 5 个 Triton kernel，每个把一串运算合成一遍读写（设计见 3.11）：
+
+| 模型 | kernel | 合进来的运算 |
+|---|---|---|
+| GPT-2 | `add_layer_norm` | 残差相加（fp32 的残差流）、LayerNorm、转成 bf16 |
+| GPT-2 | `rope_store` | q、k 的 RoPE（在 fp32 上算，再转回 bf16），k、v 写进 KV 池 |
+| Qwen3 | `add_rms_norm` | 残差相加（bf16）、RMSNorm |
+| Qwen3 | `qk_norm_rope_store` | 每个 q、k 头的 RMSNorm 和 RoPE，k、v 写进 KV 池 |
+| Qwen3 | `silu_mul` | SiLU(gate) × up |
+
+  - 残差相加并进它后面那个 norm 的 kernel，残差流原地更新，不再单独占 kernel。
+  - 每层只剩 4 个矩阵乘、2 个注意力 kernel，加上 Qwen3 的 4 个、GPT-2 的 3 个融合 kernel（GPT-2 另有 GELU）。decode 图的 kernel 数：Qwen3 1525 → 282，GPT-2 424 → 122。
+  - EAGLE 的草稿模型是一层 GPT-2 block，也用 GPT-2 的两个 kernel。
+  - 开关是 `EngineConfig.fused_kernels`，默认打开。原来的写法保留：训练草稿模型要反向传播，E0 和 nanoGPT 逐位比较也要用它，这次的对照组也是它。
+- **正确性：**
+  - [tests/test_fused.py](tests/test_fused.py)：每个 kernel 在随机数据上（1–4096 个 token）和原来的写法比。RoPE、写 KV、残差流、SiLU × up 和 v 逐位相同。norm 里 fp32 求和的顺序不同，偶尔有值落到 bf16 舍入边界的另一侧：不同的元素最多占 2.0e-4，差值不超过这个张量最大值的 0.54%。
+  - E0 加了 `--fused`（见 E0）：Qwen3 和 GPT-2 相对 fp32 的误差和不融合时、和 HF 与 nanoGPT 自己的 bf16 都在同一水平。GPT-2 在 gather 注意力下不再和 nanoGPT 逐位相同，因为 LayerNorm 的求和顺序变了。
+  - [tests/test_engine.py](tests/test_engine.py) 全部通过（默认融合）：两个模型、三种注意力，分块 prefill、前缀缓存、n-gram 和 EAGLE。
+- **测法：** 对照组和改动是同一份代码，只差 `--no-fused-kernels`。每一项都按"不融合、融合、不融合"的顺序跑，变化相对前后两次的平均：
+  - **图里的 kernel：** 新的 [bench/bench_kernels.py](bench/bench_kernels.py)。每张图回放 5 组、每组 50 次，墙钟取居中的那组；另用 profiler 统计 50 次回放的 kernel。
+  - **单步 decode：** [bench/bench_decode_step.py](bench/bench_decode_step.py)（同 E4、E5）。Qwen3 每条 prompt 1024 个 token，batch 1–48；GPT-2 每条 512 个 token，batch 1、8、32、64。
+  - **W1：** [bench/bench_offline.py](bench/bench_offline.py)。
+  - **W4，temperature 1.0：** [bench/bench_spec.py](bench/bench_spec.py)。不投机和 EAGLE γ = 4 各有前后两次对照，融合的 γ = 3 只跑一次。
+  - **EAGLE 的拆解：** [bench/bench_spec_breakdown.py](bench/bench_spec_breakdown.py)，γ = 4，temperature 1.0，带 `--detail`。
+- **运行条件：** 2026-10-08，代码版本 `3b6e574`。在同一次测试里依次运行：
+  - 单步 decode（Qwen3、GPT-2）、W1，各按不融合、融合、不融合。
+  - W4：不融合的不投机和 EAGLE γ = 4；融合的不投机、γ = 3、γ = 4；不融合的 γ = 4 和不投机。
+  - 最后是图的 kernel 统计和拆解，各按不融合、融合、不融合。
+  - 前后两次对照组的差别：W1 +0.4%，W4 −1.0% 到 +1.7%，单步 decode 大多在 ±3.4% 以内；batch 1 那一行差得多（Qwen3 5.20 对 4.75 ms，GPT-2 1.78 对 1.48 ms），GPT-2 batch 32 差 5.4%。
+  - 图的 kernel 统计里，同一张图两次不融合的墙钟可以差 25%（起草链 0.54 对 0.68 ms），这张卡的频率在变。kernel 数是确定的，时间只看量级。
+
+**图里的 kernel**（改动前两次 → 改动后；"其他"是矩阵乘和注意力以外的 kernel，GPU 时间来自 profiler；墙钟是回放一次图的时间）：
+
+| 图 | kernel 数 | 其他：个数 / GPU 时间 | 墙钟 |
+|---|---|---|---|
+| Qwen3 的 decode，batch 1 | 1525 → 282 | 1357 → 114 / 1.59–1.71 → 0.16 ms | 3.84–4.09 → 2.59 ms |
+| Qwen3 的 decode，batch 64 | 1523–1524 → 282 | 1356 → 114 / 2.02–2.05 → 0.18 ms | 12.70–12.90 → 10.67 ms |
+| GPT-2 的 decode，batch 1 | 424 → 122 | 352 → 50 / 0.44–0.45 → 0.06 ms | 1.09–1.11 → 0.65 ms |
+| GPT-2 的 decode，batch 64 | 436 → 134 | 352 → 50 / 0.53 → 0.08 ms | 3.80–4.02 → 3.27 ms |
+| GPT-2 的验证步，8 个 token | 424 → 122 | 352 → 50 / 0.49–0.55 → 0.08 ms | 1.52–1.60 → 0.76 ms |
+| EAGLE 的补算，8 行 | 42 → 16 | 35 → 9 / 0.06 → 0.01 ms | 0.12–0.14 → 0.06 ms |
+| EAGLE 的起草链，batch 1 | 213 → 135 | 188 → 110 / 0.25–0.26 → 0.18 ms | 0.54–0.68 → 0.42 ms |
+
+- 起草链里剩下的 110 个大多是每次起草的 softmax、采样和拷贝，不在这次融合的范围里。
+
+**单步 decode**（ms；括号里是相对前后两次平均的变化）：
+
+| batch | Qwen3：不融合（前 / 后） | Qwen3：融合 | GPT-2：不融合（前 / 后） | GPT-2：融合 |
+|---|---|---|---|---|
+| 1 | 5.20 / 4.75 | 3.19（−35.9%） | 1.78 / 1.48 | 1.17（−28.1%） |
+| 2 | 5.41 / 5.37 | 3.57（−33.8%） | | |
+| 4 | 5.91 / 5.71 | 3.91（−32.7%） | | |
+| 8 | 6.78 / 6.76 | 4.80（−29.0%） | 1.94 / 1.89 | 1.38（−28.2%） |
+| 16 | 8.89 / 8.93 | 6.78（−24.0%） | | |
+| 32 | 12.15 / 12.13 | 10.64（−12.4%） | 2.81 / 2.96 | 2.48（−14.2%） |
+| 48 | 16.61 / 16.63 | 14.92（−10.2%） | | |
+| 64 | | | 4.22 / 4.17 | 3.70（−11.8%） |
+
+**W1**（3 次的中位数）：
+
+| | 不融合（前 / 后） | 融合 | 变化 |
+|---|---|---|---|
+| 输出吞吐 | 2703 / 2712 token/s | **3200 token/s** | +18.2% |
+| decode 步 | 14.23 / 14.20 ms | 12.40 ms | −12.7% |
+| prefill 步 | 38.8 / 38.3 ms | 24.6 ms | −36.2% |
+| 总耗时里的 decode / prefill | 47.5、47.4 s / 6.3、6.2 s | 41.4 s / 4.0 s | −12.7% / −36.2% |
+| TPOT 中位数 | 17.96 / 17.87 ms | 15.31 ms | −14.5% |
+| 录 20 个 decode 图 | 1.83 / 1.79 s | 0.80 s | |
+
+**W4，temperature 1.0：输出吞吐**（token/s；括号里是相对同一配置不融合两次平均的变化）：
+
+| 并发 | 不投机：不融合（前 / 后） | 不投机：融合 | EAGLE γ = 4：不融合（前 / 后） | EAGLE γ = 4：融合 | EAGLE γ = 3：融合 |
+|---|---|---|---|---|---|
+| 1 | 626 / 625 | 869（+38.9%） | 1038 / 1040 | **1386（+33.4%）** | 1336 |
+| 8 | 3874 / 3839 | 5306（+37.6%） | 5649 / 5642 | 7525（+33.3%） | **7686** |
+| 32 | 8872 / 8869 | 12051（+35.8%） | 10615 / 10511 | 13571（+28.5%） | **15139** |
+| 64 | 11481 / 11452 | 15069（+31.4%） | 14268 / 14507 | **18582（+29.2%）** | 18269 |
+
+- **相对不投机：** 不融合时 EAGLE γ = 4 是 +66.1%、+46.4%、+19.1%、+25.5%（并发 1、8、32、64）；融合以后 γ = 4 是 +59.5%、+41.8%、+12.6%、+23.3%，γ = 3 是 +53.7%、+44.9%、+25.6%、+21.2%。
+- **每步的 token 数和接受率不变：** γ = 4 不融合时每步 2.74–2.78 个 token、接受率 0.440–0.449，融合后是 2.76–2.80 个、0.444–0.453。
+
+**W4 的 decode 步和 prefill 步**（每个并发取 3 次里吞吐居中的那次；每格是"不融合（前后两次的平均）→ 融合"，ms）：
+
+| 并发 | decode 步：不投机 | decode 步：EAGLE γ = 4 | prefill 步：不投机 | prefill 步：EAGLE γ = 4 | 省下的总时间里 prefill 的比例（不投机 / EAGLE） |
+|---|---|---|---|---|---|
+| 1 | 1.57 → 1.13 | 2.59 → 1.97 | 9.09 → 3.99 | 10.39 → 5.60 | 3% / 6% |
+| 8 | 1.80 → 1.36 | 3.10 → 2.49 | 8.63 → 3.98 | 10.34 → 5.41 | 22% / 35% |
+| 32 | 2.48 → 2.00 | 5.27 → 4.56 | 8.87 → 4.32 | 10.55 → 5.73 | 44% / 57% |
+| 64 | 3.27 → 2.79 | 6.28 → 5.88 | 9.63 → 4.75 | 11.12 → 6.46 | 55% / 63% |
+
+- **prefill 步：** prefill 的总时间除以 prefill 的步数。EAGLE 的 prefill 步还包括草稿模型对整段 prompt 算一遍。
+
+**EAGLE 的拆解**（γ = 4，temperature 1.0，`--detail`：各部分前后都同步，串行相加；每格是"不融合（前后两次的平均）→ 融合"，ms）：
+
+| | 并发 1 | 并发 8 | 并发 32 | 并发 64 |
+|---|---|---|---|---|
+| 验证：目标模型的图 | 1.18 → 0.71 | 1.46 → 0.97 | 3.10 → 2.67 | 3.65 → 3.37 |
+| 验证：写输入、logits、接受判断、拷回 CPU | 0.80 → 0.79 | 0.84 → 0.82 | 1.06 → 1.07 | 1.30 → 1.31 |
+| 起草：补算的图 | 0.14 → 0.10 | 0.16 → 0.13 | 0.31 → 0.27 | 0.36 → 0.36 |
+| 起草：起草链的图 | 0.60 → 0.49 | 0.78 → 0.67 | 1.00 → 0.94 | 1.24 → 1.22 |
+| 起草：其余 | 0.29 → 0.29 | 0.32 → 0.32 | 0.44 → 0.45 | 0.49 → 0.50 |
+| 一步合计（含"其他"） | 3.03 → 2.40 | 3.62 → 2.97 | 6.05 → 5.53 | 7.24 → 6.98 |
+
+结果：
+
+- **kernel 数降到原来的 1/5（Qwen3）和 2/7（GPT-2），decode 图里矩阵乘和注意力以外的 GPU 时间少了 85–91%：** Qwen3 batch 1 时从 1.59–1.71 ms 降到 0.16 ms，回放一次 decode 图从 3.84–4.09 ms 降到 2.59 ms。剩下的主要是矩阵乘。
+- **单步 decode：Qwen3 每步省 1.5–2.1 ms，GPT-2 省 0.41–0.54 ms，和 batch 大小关系不大。** 省下的是每个 kernel 的固定开销：每张图少了约 1240 个（Qwen3）和 300 个（GPT-2）kernel。batch 小时一步本来就短，所以比例大：Qwen3 batch 1 快 36%，batch 48 快 10%。
+- **W1 吞吐提高 18.2%，到 3200 token/s：** 总耗时从 54.0、53.8 秒降到 45.6 秒，其中 decode 省 6.1 秒，prefill 省 2.3 秒。
+  - decode 步快 12.7%（batch 约 47），每步省 1.8 ms，和单步 decode 在 batch 48 时省的 1.7 ms 一致。
+  - prefill 步快 36%。W1 不分块，prefill 不录图，一步最多 16,384 个 token。token 多时，原来每个小运算都要读写一遍整个激活，有些中间结果还是 fp32：单独检查时，一步 14,400 个 token，这些 kernel 的 GPU 时间（314–331 ms）比全部矩阵乘（214–229 ms）还长，融合以后只剩 36 ms（见 3.11）。
+- **W4：不投机快 31–39%，EAGLE γ = 4 快 28–33%，一部分来自 prefill：**
+  - decode 步：不投机每步省 0.43–0.48 ms，EAGLE 省 0.40–0.71 ms。
+  - prefill 步快了约一倍：不投机从 8.6–9.6 ms 降到 4.0–4.8 ms，EAGLE 从 10.3–11.1 ms 降到 5.4–6.5 ms。W4 的 prefill 步大多只有一条 64–512 个 token 的 prompt（并发 8 时 256 条请求是 246 个 prefill 步），GPU 要算的不多，时间主要花在 CPU 一个个提交 kernel 上，和 E5 里不录图的 decode 一样。单独检查：一条 300 个 token 的 prompt，墙钟 8.1 ms，GPU 只算了 3.2–3.6 ms；融合以后 kernel 从 698 个降到 292 个，墙钟 4.3 ms（见 3.11）。
+  - 并发越高，prefill 占的时间越多（不融合、不投机时，并发 64 占 26%），所以并发 32、64 时省下的总时间有 44–63% 在 prefill。
+- **EAGLE 相对不投机的收益略降：** 每个并发取最好的 γ，从 E8b.2 的 +67%、+49%、+27%、+26% 变成 +60%、+45%、+26%、+23%。两边的 decode 步省的时间差不多，但不投机的一步本来就短，比例更大；prefill 两边都快了约一倍。
+  - 并发 32 时 γ = 3 仍然明显好于 γ = 4（+25.6% 对 +12.6%），原因还是补齐（见 E8b）：γ = 4 时验证步要补到 256 个 token。
+- **并发 64 时 EAGLE 的 decode 步只省 0.40 ms：** 拆解里，验证步的图少 0.28 ms，并发 1–32 时是 0.44–0.49 ms；补算和起草链的图几乎不变。
+  - batch 64 时，起草链的时间主要花在 4 次 16,384 列的 logits、softmax 和采样上，这部分没有融合。
+  - 验证步为什么省得少，没有查清：单独回放同样形状的图（320 个 token）时少 0.64 ms（见 3.11）。
+
+**结论：** 把每层逐元素的部分合成 5 个 Triton kernel 以后，decode 图里的 kernel 从 1525 个降到 282 个（Qwen3），每步省 1.5–2.1 ms；不录图的 prefill 也快了 36%（W1）到约一倍（W4），前者省的是读写激活的带宽，后者省的是 CPU 提交 kernel 的时间。W1 的吞吐提高 18.2%，到 3200 token/s；W4 上不投机快 31–39%，EAGLE 快 28–33%，相对不投机仍有 +23–60%。GPT-2 上还能降的固定开销是起草链里每次起草的采样、不录图的 prefill（融合后并发 64 时仍占总时间的 17–22%），以及并发 32 时验证步的补齐。
+
 ## 3. 工程记录与设计决策
 
 ### 3.1 用 FlexAttention 做分页注意力
@@ -1364,11 +1506,39 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 
   - 目标模型每层约 35 个 kernel，大多数是 1–2 µs 的逐元素 kernel：RoPE、bf16 和 fp32 之间的转换、写 KV、残差相加。草稿的一步 block 也一样。
   - 起草链要算 4 次 logits、softmax 和采样，3 步 block 只能一步接一步地算，所以 kernel 数和耗时都是目标模型一步的一半。草稿的参数只有目标模型的 6.7%，在 batch 1 时不起作用。
-  - 把逐元素的 kernel 融合起来（比如 RoPE 和写 KV 合成一个 kernel），目标模型和草稿应该都会变快，还没有做。
+  - E9 把这些逐元素的 kernel 融合了：验证步从 424 个 kernel 降到 122 个，起草链从 213 个降到 135 个，补算从 42 个降到 16 个。起草链剩下的大多是每次起草的 softmax、采样和拷贝。
 - **序列结束时要清掉草稿：**
   - 每条序列的草稿分布是整步共用的 [batch, γ, 16,384] fp32 张量的一个视图。结束的序列如果还留着它，整个张量都释放不了。
   - E8b 的测试里，temperature 1.0、并发 64 时显存峰值因此到了 4.96 GiB（贪心时 3.25 GiB）。现在序列结束或被抢占时清掉草稿（`7b244d3`），[tests/test_engine.py](tests/test_engine.py) 检查结束的序列不再留着草稿分布。
   - 单独检查：修复以后，temperature 1.0 下并发 8、32、64 的显存峰值是 2.95、3.11、3.25 GiB，和贪心时相同；吞吐是 4611、8933、11240 token/s，和修复前相差 −3%～+1%，在不同测试之间的波动以内。
+
+### 3.11 融合逐元素的 kernel
+
+代码在 [minivllm/fused.py](minivllm/fused.py)，模型里的接法是 [minivllm/models/qwen3.py](minivllm/models/qwen3.py)、[minivllm/models/gpt2.py](minivllm/models/gpt2.py) 的 `forward_fused`：
+
+- **舍入和原来的写法一致：** 原来的写法在哪里存 bf16 的张量，kernel 就在那里把 fp32 的值舍入到 bf16，再接着算。所以除了 norm 里求和的顺序，结果和原来逐位相同（E9 的 test_fused）。
+  - Qwen3 的 RoPE 原来是在 bf16 上算的：x·cos、x·sin 各舍入一次，相加以后再舍入一次，kernel 也照这样舍入三次。
+  - GPT-2 的 RoPE 在 fp32 上算，最后才转回 bf16，kernel 也只在最后舍入。
+- **要关掉 FMA 合并：** 一开始，Qwen3 的 q 有一成以上的元素和原来差 1 个 ulp。看 PTX 发现，LLVM 把"fp32 相乘再舍入到 bf16"换成了 bf16 的乘法，又把 bf16(a·c) − bf16(b·s) 合成一条 `fma.rn.bf16x2`，少了一次舍入。原来的写法每个运算都是单独的 kernel，每一步都会舍入，所以 `rope_store`、`add_rms_norm`、`qk_norm_rope_store` 编译时关掉浮点合并（`enable_fp_fusion=False`）。`add_layer_norm` 例外：PyTorch 的 LayerNorm 本身是一个用了 FMA 的 CUDA kernel，保留 FMA 更接近它。
+- **残差相加并进下一个 norm：** 每个 norm 的 kernel 先把上一个分支的输出加进残差流，原地写回，再做 norm。一层的两次残差相加因此不占 kernel，最后一层的加法并进最后的 norm。
+- **一个程序算一个 token 的全部头：** RoPE 和 q、k 的 norm 把 [头数, head_dim] 当成一个 2D 的 tile。这些 kernel 受带宽或固定开销限制，按 token 分程序就够了。
+- **k、v 只写进池：** Triton 注意力的 prefill 和 decode 都从池里读 K/V，所以融合的 kernel 只把 k、v 写进池。gather、flex 和 triton-decode 的 prefill 要直接用新 token 的 k、v，这时才另外输出（`need_kv`）。
+- **原来的写法保留：** 训练草稿模型要反向传播（这些 kernel 没有写反向），E0 和 nanoGPT 逐位比较也要用。`fused_kernels=False` 时走原来的写法，E9 的对照组就是它；E1–E8 都是在它上面测的。
+- **prefill 时省下的是什么**（单独检查：一个 prefill 步经过 engine.step()，不录图；按不融合、融合、不融合各测一次，每格是"不融合的两次 → 融合"）：
+
+| | 墙钟 | GPU 在算的时间 | kernel 数 | 其中矩阵乘和注意力以外的 GPU 时间 |
+|---|---|---|---|---|
+| GPT-2 + EAGLE，1 条 × 300 个 token | 8.10、8.14 → 4.31 ms | 3.20、3.61 → 2.35 ms | 698 → 292 | 1.04、1.60 → 0.37 ms |
+| GPT-2 + EAGLE，8 条 × 300 个 token | 17.95、17.01 → 13.01 ms | 13.59、14.35 → 11.41 ms | 701 → 295 | 4.03、4.06 → 1.18 ms |
+| Qwen3，1 条 × 900 个 token | 33.97、37.63 → 23.63 ms | 28.85、31.53 → 21.98 ms | 1520 → 277 | 7.81、7.83 → 0.76 ms |
+| Qwen3，16 条 × 900 个 token | 568.7、546.8 → 314.3 ms | 595.1、560.5 → 312.8 ms | 1520 → 277 | 331.0、313.7 → 36.4 ms |
+
+  - **W4 的 prefill 步大多只有一条短 prompt，卡在 CPU 上：** 一条 300 个 token 时，GPU 只算 3.2–3.6 ms，墙钟却是 8.1 ms，是 CPU 一个个提交 kernel 拖住了（同 3.4）。融合以后 kernel 少了六成，墙钟几乎减半。EAGLE 的 prefill 步还包括草稿模型对整段 prompt 算一遍。
+  - **W1 的大 prefill 卡在带宽上：** 一步 14,400 个 token 时，原来矩阵乘和注意力以外的 kernel 在 GPU 上要 314–331 ms，比全部矩阵乘（214–229 ms）还长。原因是每个小运算都要读写一遍整个激活，RMSNorm 中间还有 fp32 的张量。融合以后每串运算只读写一遍，剩 36 ms。
+- **并发 64 时，验证步在引擎里省得少，原因没有查清**（单独检查）：
+  - 单独回放并发 64 形状的图（64 条序列，上下文约 400 个 token）时，验证步的图（320 个 token）从 3.89 ms 降到 3.25 ms，其中矩阵乘和注意力以外的 GPU 时间从 0.68 ms 降到 0.14 ms。E9 的拆解里，引擎中验证步的图（73% 的步补齐到 320 个 token）只从 3.65 ms 降到 3.37 ms。
+  - 查过不是降频：四个并发连着跑、每 200 ms 记一次，SM 频率基本稳定在 2745–2782 MHz。后半段功耗到了 130–138 W（融合时更高），离 140 W 的上限很近；只跑并发 64 时，驱动的功耗限速和温度限速计数在运行前后都没有增加。
+  - 并发 64 的结果在不同运行之间变化也大：另外三组单独检查里，并发 64 时 EAGLE 的 decode 步省 0.22–0.75 ms，正式测试是 0.40 ms。
 
 ## 4. 实验列表
 
@@ -1391,3 +1561,4 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 | E8b.2 | 验证步之后，EAGLE 补算和起草链的输入由一个 Triton kernel 在 GPU 上写好；验证前给起草链预分块 | 改动前的代码（`f9a5b01`） | W4，temperature 1.0 和贪心，并发 1、8、32、64；拆解 | 已完成：起草每步少 0.29–0.43 ms；temperature 1.0 下 EAGLE 吞吐提高 3–10%，相对不投机 +26–67%；贪心每步快 0.27–0.31 ms，见第 2 节 |
 | E8c | DSpark 式并行起草 + Markov head | E8b | W4 | 待做 |
 | E8d | 置信度调度：按预测的接受概率和并发选验证长度 | 固定验证长度 | W4，并发 1–64 | 待做 |
+| E9 | 融合逐元素的 kernel（`fused_kernels=True`）：每层的 norm、RoPE、写 KV、残差相加和 SiLU × up 合成 5 个 Triton kernel | 原来的写法（`--no-fused-kernels`），同一份代码 | 图里的 kernel；单步 decode；W1；W4，temperature 1.0，并发 1、8、32、64；拆解 | 已完成：decode 图的 kernel 从 1525 个降到 282 个（Qwen3），每步省 1.5–2.1 ms；W1 吞吐提高 18.2%，prefill 步快 36%；W4 上不投机快 31–39%、EAGLE 快 28–33%，不录图的 prefill 步快约一倍，见第 2 节 |

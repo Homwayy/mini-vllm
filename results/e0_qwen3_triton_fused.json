@@ -1,0 +1,125 @@
+{
+  "model": "Qwen3-0.6B",
+  "attention": "triton",
+  "fused": true,
+  "block_size": 16,
+  "new_tokens": 64,
+  "prompts": [
+    {
+      "prompt_len": 17,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.5117664337158203,
+        "mean_abs_err": 0.043297894299030304,
+        "argmax_agree": 0.9411764740943909,
+        "max_fp32_regret": 0.04472160339355469
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.5117664337158203,
+        "mean_abs_err": 0.041755255311727524,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.6954495906829834,
+        "mean_abs_err": 0.03440965712070465,
+        "argmax_agree": 0.953125,
+        "max_fp32_regret": 0.08468055725097656
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.35134315490722656,
+        "mean_abs_err": 0.034049857407808304,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.08468055725097656
+      },
+      "greedy_first_divergence": 3,
+      "hf_top2_margin_at_divergence": 0.0
+    },
+    {
+      "prompt_len": 120,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.7942948341369629,
+        "mean_abs_err": 0.04766998812556267,
+        "argmax_agree": 0.9750000238418579,
+        "max_fp32_regret": 0.031249046325683594
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.670861005783081,
+        "mean_abs_err": 0.0492246113717556,
+        "argmax_agree": 0.9666666984558105,
+        "max_fp32_regret": 0.11180877685546875
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.5247306823730469,
+        "mean_abs_err": 0.03964671865105629,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.07096290588378906
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.4826475977897644,
+        "mean_abs_err": 0.04072605445981026,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.10083580017089844
+      },
+      "greedy_first_divergence": 1,
+      "hf_top2_margin_at_divergence": 0.0
+    },
+    {
+      "prompt_len": 517,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 1.2499241828918457,
+        "mean_abs_err": 0.03859703615307808,
+        "argmax_agree": 0.9748549461364746,
+        "max_fp32_regret": 0.1908426284790039
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.6019353866577148,
+        "mean_abs_err": 0.038780294358730316,
+        "argmax_agree": 0.9729207158088684,
+        "max_fp32_regret": 0.1908426284790039
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.23366308212280273,
+        "mean_abs_err": 0.03414905443787575,
+        "argmax_agree": 0.96875,
+        "max_fp32_regret": 0.06244087219238281
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.24380135536193848,
+        "mean_abs_err": 0.03622223809361458,
+        "argmax_agree": 0.953125,
+        "max_fp32_regret": 0.11020183563232422
+      },
+      "greedy_first_divergence": 6,
+      "hf_top2_margin_at_divergence": 0.125
+    },
+    {
+      "prompt_len": 1000,
+      "prefill_ours_vs_fp32": {
+        "max_abs_err": 0.8156814575195312,
+        "mean_abs_err": 0.03696160763502121,
+        "argmax_agree": 0.9760000705718994,
+        "max_fp32_regret": 0.09931564331054688
+      },
+      "prefill_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.6219949722290039,
+        "mean_abs_err": 0.0362514965236187,
+        "argmax_agree": 0.9790000319480896,
+        "max_fp32_regret": 0.11992263793945312
+      },
+      "decode_ours_vs_fp32": {
+        "max_abs_err": 0.49686431884765625,
+        "mean_abs_err": 0.03689899668097496,
+        "argmax_agree": 1.0,
+        "max_fp32_regret": 0.0
+      },
+      "decode_hf_bf16_vs_fp32": {
+        "max_abs_err": 0.5587143898010254,
+        "mean_abs_err": 0.03720500320196152,
+        "argmax_agree": 0.984375,
+        "max_fp32_regret": 0.037006378173828125
+      },
+      "greedy_first_divergence": 7,
+      "hf_top2_margin_at_divergence": 0.125
+    }
+  ]
+}
