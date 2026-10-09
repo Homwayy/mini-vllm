@@ -8,7 +8,8 @@ forward is captured once and replayed; logits are computed outside the graph for
 With chunked prefill, a step that computes more than one token of some sequence (a mixed step) is padded to
 a token-count bucket instead. Its sequences sit in a fixed number of slots: the padding tokens form one
 more sequence that reads and writes only the scratch block, and unused slots have no tokens. The prefill
-kernel then runs with a grid that depends only on the bucket, so mixed steps are captured as well.
+kernel then runs with a grid that depends only on the bucket, so mixed steps are captured as well. A bucket
+of t tokens uses only min(max_num_seqs, t) + 1 slots, since the kernel runs programs for every slot.
 
 Without chunked prefill, a prefill step of at most prefill_graph_tokens tokens takes the same layout, padded
 to its own token buckets with prefill-sized tiles, and is captured too: eager, such a step is bound by
@@ -276,9 +277,12 @@ class ModelRunner:
     def mixed_meta(self, padded: int, prefill: bool):
         # a padded prefill step has eager prefill's tiles (prefill_block_m); a mixed step keeps them small
         block_m = prefill_block_m(padded, self.group_pad) if prefill else self.mixed_block_m
+        # a step of `padded` tokens has at most that many sequences, and the padding tokens take one more slot;
+        # the prefill kernel runs programs for every slot, so the slots no step of this bucket can use are left out
+        s = min(self.cfg.max_num_seqs, padded) + 1
         return AttnMetadata(
-            is_prefill=True, slot_mapping=self.mix_slots[:padded], block_tables=self.mix_block_tables,
-            context_lens=self.mix_seq_lens, backend_state=(self.mix_cu, block_m),
+            is_prefill=True, slot_mapping=self.mix_slots[:padded], block_tables=self.mix_block_tables[:s],
+            context_lens=self.mix_seq_lens[:s], backend_state=(self.mix_cu[: s + 1], block_m),
         )
 
     def mixed_hidden(self, padded: int, prefill=False):
