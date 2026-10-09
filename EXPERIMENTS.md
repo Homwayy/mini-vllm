@@ -2,7 +2,7 @@
 
 从零写一个小型 LLM 推理引擎（mini vLLM），在一张 12 GB 的笔记本 GPU 上服务 Qwen3-0.6B，逐项对比 KV cache 的管理方式、调度策略和注意力实现对吞吐和延迟的影响。
 
-目前完成了 E0（正确性）到 E7，E8a、E8b、E8b.1、E8b.2、E8c，以及 E9、E10。在固定的离线负载 W1（256 条请求）上：
+目前完成了 E0（正确性）到 E7，E8a、E8b、E8b.1、E8b.2、E8c、E8c.1，以及 E9、E10。在固定的离线负载 W1（256 条请求）上：
 
 - **E1（基线）：** 静态批处理的起点是 1760 输出 token/s，是 HF transformers 静态批处理（160 token/s）的 11.0 倍；但 KV 池里平均只有 26.2% 的槽位存着 token。
 - **E2（分页 KV）：** KV 改成分页以后，KV 利用率从 52% 提高到 99%，同一批能放的序列从 32 条提高到最多 60 条，吞吐提高 24.9%，到 2204 token/s。提升受限于静态批处理的尾部：每批都要等其中最长的请求。
@@ -56,6 +56,7 @@
 - **E8c（DSpark 式并行起草）：** 草稿模型一次前向起草一整段，它要读的上下文 K/V 由目标模型的前向顺手写好，不用补算；再用一个低秩的 Markov head 补上和前一个 token 的依赖。
   - 起草每步省 31–44%，prefill 步短 8–18%。但离线时第 2–4 个草稿的接受率只有 0.42–0.49（EAGLE 是 0.69–0.70），每步的 token 少 14–19%。
   - 每个并发都取最好的 γ，比 EAGLE 慢 2–9%，比不投机快 17–44%：在这个规模上，并行起草省下的时间抵不过接受率的损失。
+- **E8c.1（每个草稿的采样合成一个 kernel）：** EAGLE 和 DSpark 起草时，每个草稿的 softmax、采样和取 token 原来要十几个小 kernel，现在是一个 Triton kernel，贪心的行只取 argmax。起草每步少 0.06–0.18 ms；吞吐在贪心时提高 2.4–6.9%，temperature 1.0 时提高 1.1–5.0%。
 
 详见第 2 节。
 
@@ -67,7 +68,7 @@
   - W2 的延迟：[bench/bench_online.py](bench/bench_online.py)。
   - E4 的单层注意力和单步 decode（E5、E9 也用它）：[bench/bench_attention.py](bench/bench_attention.py)、[bench/bench_decode_step.py](bench/bench_decode_step.py)；E4b 的单层 prefill：[bench/bench_prefill.py](bench/bench_prefill.py)；E7 的单步耗时：[bench/bench_mixed_step.py](bench/bench_mixed_step.py)。
   - E9 的图里的 kernel：[bench/bench_kernels.py](bench/bench_kernels.py)；融合 kernel 的逐个检查：[tests/test_fused.py](tests/test_fused.py)；E0 的两个脚本加 `--fused` 测融合以后的误差。
-  - E8 的投机解码：[bench/bench_spec.py](bench/bench_spec.py)，每步时间的拆解：[bench/bench_spec_breakdown.py](bench/bench_spec_breakdown.py)，E8b.1 的接受判断单独测：[bench/bench_verify.py](bench/bench_verify.py)；E8b 草稿模型的训练和离线接受率：[train_draft.py](train_draft.py)，E8c 的：[train_dspark.py](train_dspark.py)；E8a–E8c 的正确性：[tests/test_spec.py](tests/test_spec.py)、[tests/test_engine.py](tests/test_engine.py)。
+  - E8 的投机解码：[bench/bench_spec.py](bench/bench_spec.py)，每步时间的拆解：[bench/bench_spec_breakdown.py](bench/bench_spec_breakdown.py)，E8b.1 的接受判断单独测：[bench/bench_verify.py](bench/bench_verify.py)；E8b 草稿模型的训练和离线接受率：[train_draft.py](train_draft.py)，E8c 的：[train_dspark.py](train_dspark.py)；E8a–E8c.1 的正确性：[tests/test_spec.py](tests/test_spec.py)、[tests/test_engine.py](tests/test_engine.py)。
 - 负载文件在 [bench/workloads/](bench/workloads/)，由 [bench/workloads.py](bench/workloads.py) 用固定的 seed 生成。
 - 第 3 节记录实现上的设计决策。其中的数字除了注明来自 results/ 的，都来自单独的检查脚本（没有放进仓库），只用来说明设计的原因；需要作为结论的数字，会在后面的实验里正式测量。
 
@@ -176,7 +177,7 @@
 
 - **输出吞吐：** 我们的引擎是 3 次的中位数，HF 只跑了 1 次（见 E1）。
 - **显存峰值：** PyTorch 已分配显存的峰值（max_memory_allocated）。
-- **E8（投机解码）** 在 GPT-2 和 W4 上测，不在这张表里，见 E8a、E8b、E8b.1、E8b.2、E8c。
+- **E8（投机解码）** 在 GPT-2 和 W4 上测，不在这张表里，见 E8a、E8b、E8b.1、E8b.2、E8c、E8c.1。
 
 ### E0：正确性
 
@@ -1219,7 +1220,7 @@
 | EAGLE 的补算，8 行 | 42 → 16 | 35 → 9 / 0.06 → 0.01 ms | 0.12–0.14 → 0.06 ms |
 | EAGLE 的起草链，batch 1 | 213 → 135 | 188 → 110 / 0.25–0.26 → 0.18 ms | 0.54–0.68 → 0.42 ms |
 
-- 起草链里剩下的 110 个大多是每次起草的 softmax、采样和拷贝，不在这次融合的范围里。
+- 起草链里剩下的 110 个大多是每次起草的 softmax、采样和拷贝，不在这次融合的范围里（E8c.1 把它们合成了一个 kernel）。
 
 **单步 decode**（ms；括号里是相对前后两次平均的变化）：
 
@@ -1446,7 +1447,82 @@
 - **每步的 token 数比训练日志里的估计高 4–6%（2.25–2.30 对 2.17），原因是文本不同：** 训练日志在随机的验证集窗口上算，各位置的平均接受率直接相乘。单独检查（见 3.13）：在 W4 自己的文本上（prompt 加上目标模型 temperature 1.0 的续写），每个锚点各自相乘再平均，DSpark 估计 2.27，引擎里起草满 4 个的步也是 2.27；EAGLE 是 2.82 对 2.78。
 - **代价：** 草稿的参数多 59%（13.13 对 8.27 M），训练 61 对 42 分钟；录图多 10 MiB（γ = 4，128 对 118 MiB）；显存峰值多 0.01–0.05 GiB；草稿的 KV 池一样大（一层，192 MiB）。ITL 的 p99 反而低 7–20%，因为 decode 步和 prefill 步都更短。
 
-**结论：** 在这个规模上（124M 的目标模型、一层的草稿、4096 万个 token 的训练），DSpark 式的并行起草不如 EAGLE：每个并发取最好的 γ，吞吐低 2–9%，相对不投机仍有 +17–44%。并行结构该省的都省了：起草每步少 31–44%，不用补算，prefill 步短 8–18%，注入只让验证多 0.03–0.06 ms。但离线时第 2–4 个草稿的接受率只有 0.42–0.49（EAGLE 是 0.69–0.70），每步的 token 少 14–19%。估算：γ = 4 时，DSpark 每步要多 0.09–0.19 个 token（第 2–4 个位置的接受率都提高 8–18%），或者起草再省 0.08–0.41 ms，才能和 EAGLE 持平。值得试的方向：更深的草稿，让占位行多几层来推断中间的 token（每多一层，每步约多 0.1 ms（并发 1）到 0.35 ms（并发 64），估算）；把每个草稿的采样合成一个 kernel，块的图里 4 步采样有 63 个 kernel，EAGLE 的起草链也能用上；按置信度选验证长度（E8d）。
+**结论：** 在这个规模上（124M 的目标模型、一层的草稿、4096 万个 token 的训练），DSpark 式的并行起草不如 EAGLE：每个并发取最好的 γ，吞吐低 2–9%，相对不投机仍有 +17–44%。并行结构该省的都省了：起草每步少 31–44%，不用补算，prefill 步短 8–18%，注入只让验证多 0.03–0.06 ms。但离线时第 2–4 个草稿的接受率只有 0.42–0.49（EAGLE 是 0.69–0.70），每步的 token 少 14–19%。估算：γ = 4 时，DSpark 每步要多 0.09–0.19 个 token（第 2–4 个位置的接受率都提高 8–18%），或者起草再省 0.08–0.41 ms，才能和 EAGLE 持平。值得试的方向：更深的草稿，让占位行多几层来推断中间的 token（每多一层，每步约多 0.1 ms（并发 1）到 0.35 ms（并发 64），估算）；把每个草稿的采样合成一个 kernel，块的图里 4 步采样有 63 个 kernel，EAGLE 的起草链也能用上（E8c.1 已做）；按置信度选验证长度（E8d）。
+
+### E8c.1：每个草稿的采样合成一个 kernel（GPT-2，W4）
+
+- **动机：** E8c 的单独检查（3.13）里，DSpark 的块的图有 92–93 个 kernel，其中 63 个是 4 个草稿各自的采样：查 W₁、转 bf16、乘 W₂、转 fp32、相加、除以 temperature、softmax、指数噪声、argmax、取 token id、写 token 和 q，每个草稿 15 个。EAGLE 的起草链也一样：E9 以后它的 135 个 kernel 里，矩阵乘和注意力以外的有 110 个，大多是每个草稿的采样。batch 1 时这些 kernel 每个只要 1–2 µs，但只能一个接一个地跑。贪心的行也照样算整个 softmax 和噪声，最后才被 argmax 换掉。
+- **改动：** [minivllm/spec/draft_sampling.py](minivllm/spec/draft_sampling.py) 的 `sample_drafts`：一个 Triton kernel 采一个草稿，EAGLE 的起草链和 DSpark 的块都用它（设计见 3.14）。
+  - 每行一个程序。贪心的行只扫一遍 logits 取 argmax（并列时取第一个，同 torch.argmax），不写 q：接受判断只在采样的行上用 q。
+  - 采样的行扫两遍：第一遍在线求 logits / temperature 的最大值和指数和；第二遍写 q，同时用指数分布的竞争采样（同 E8b.1 的重采样）。随机数用 Triton 的 Philox，一次调用出 4 个。
+  - DSpark 的 Markov 项直接在 kernel 里加到 logits 上。`markov_in` 改存 bf16：它的行本来就要先转成 bf16 再乘 W₂，结果逐位相同。每个草稿只剩查 W₁、乘 W₂ 和这个 kernel 三个 kernel。
+  - 种子放在 GPU 上，每次起草都在图里用 PyTorch 的随机数生成器重新抽（`random_`）。所以图每次回放都重新采样，`torch.manual_seed` 也能固定结果。
+- **正确性：**
+  - [tests/test_spec.py](tests/test_spec.py) 加了 `test_draft_sampling`：
+    - 贪心的行在大量并列时取第一个 argmax；采样的行留下的 q 和 softmax(logits / t) 相差不到 1e-6。
+    - 20 万次采样里，几个高概率 token（在块的边界两侧和末尾）和其余 token 合计的频率，与 q 的最大误差是 0.0009–0.0025（容差 0.0050）。每 8 次调用共用一个种子；行多、行少的两种配置都测了。
+    - 在图里，每次回放的结果不同，同一个 seed 能复现。
+  - [tests/test_engine.py](tests/test_engine.py) 全部通过。贪心时进入 argmax 的 logits 没变，所以 EAGLE、DSpark 各组接受的草稿数和改动前逐个相同（如 626/1147、483/1683），录图和不录图生成的 token 也逐个相同。
+- **测法：** 同 E8c（[bench/bench_spec.py](bench/bench_spec.py)，W4，并发 1、8、32、64，每个并发跑 3 次取中位数），EAGLE 和 DSpark 都用 γ = 4，temperature 1.0 和贪心各一轮。对照组是改动前的代码（`b56fbdc`，放在一个 git worktree 里），每种配置都按"对照、改动后、对照"的顺序跑，变化相对两次对照的平均。拆解（[bench/bench_spec_breakdown.py](bench/bench_spec_breakdown.py)，temperature 1.0，`--detail`）也按这个顺序。
+- **运行条件：** 2026-10-09，代码版本 `3447d8f`。依次跑 temperature 1.0、贪心和拆解。
+  - temperature 1.0 那一轮排在测试的最前面，对照组前后差 −0.4% 到 +9.3%，最先跑的两组明显偏慢，所以作废。
+  - 之后另找时间先空跑一遍预热，再按原来的顺序重测 temperature 1.0，下表是重测的结果。
+  - 前后两次对照的差别：重测时 −1.3% 到 +4.6%，贪心那一轮 −2.2% 到 +1.1%，拆解 −1.6% 到 +0.8%。
+
+**temperature 1.0：输出吞吐**（token/s；括号里是相对前后两次对照平均的变化）：
+
+| 并发 | EAGLE：对照（前 / 后） | EAGLE：改动后 | DSpark：对照（前 / 后） | DSpark：改动后 |
+|---|---|---|---|---|
+| 1 | 1336 / 1338 | 1355（+1.4%） | 1237 / 1221 | 1291（+5.0%） |
+| 8 | 7678 / 7594 | 7724（+1.1%） | 7352 / 7571 | 7717（+3.4%） |
+| 32 | 14172 / 14106 | 14459（+2.3%） | 13066 / 13662 | 13710（+2.6%） |
+| 64 | 18981 / 18875 | 19341（+2.2%） | 17612 / 18339 | 18252（+1.5%） |
+
+**贪心：输出吞吐**：
+
+| 并发 | EAGLE：对照（前 / 后） | EAGLE：改动后 | DSpark：对照（前 / 后） | DSpark：改动后 |
+|---|---|---|---|---|
+| 1 | 2284 / 2235 | 2388（+5.7%） | 1520 / 1537 | 1634（+6.9%） |
+| 8 | 11776 / 11828 | 12382（+4.9%） | 9021 / 8972 | 9546（+6.1%） |
+| 32 | 21275 / 21250 | 21768（+2.4%） | 15941 / 15883 | 16625（+4.5%） |
+| 64 | 28889 / 28919 | 29833（+3.2%） | 21404 / 21380 | 22505（+5.2%） |
+
+**每个 decode 步**（ms；每格是"两次对照的平均 → 改动后"）：
+
+| | 并发 1 | 并发 8 | 并发 32 | 并发 64 |
+|---|---|---|---|---|
+| temperature 1.0：EAGLE | 2.02 → 2.01 | 2.57 → 2.52 | 4.75 → 4.60 | 5.97 → 5.88 |
+| temperature 1.0：DSpark | 1.81 → 1.74 | 2.16 → 2.08 | 4.14 → 4.02 | 5.29 → 5.15 |
+| 贪心：EAGLE | 1.88 → 1.78 | 2.43 → 2.31 | 4.51 → 4.37 | 5.66 → 5.45 |
+| 贪心：DSpark | 1.69 → 1.58 | 2.04 → 1.92 | 3.92 → 3.74 | 4.90 → 4.63 |
+
+- **每步的 token 数和接受率：** 贪心时逐位相同（EAGLE 4.24–4.36，DSpark 2.60–2.62）。temperature 1.0 时随机数不同，结果落在同样的范围里：EAGLE 每步 2.74–2.77 个 token、接受率 0.437–0.447，DSpark 2.24–2.29 个、0.311–0.324。
+
+**拆解**（temperature 1.0；每格是"两次对照的平均 → 改动后"，ms）：
+
+| | 并发 1 | 并发 8 | 并发 32 | 并发 64 |
+|---|---|---|---|---|
+| EAGLE：起草 | 0.73 → 0.66 | 0.96 → 0.90 | 1.41 → 1.26 | 1.73 → 1.58 |
+| EAGLE：`--detail` 起草链的图 | 0.47 → 0.41 | 0.65 → 0.57 | 0.85 → 0.74 | 1.10 → 0.94 |
+| EAGLE：一步合计 | 2.01 → 1.94 | 2.58 → 2.52 | 4.82 → 4.62 | 6.01 → 5.80 |
+| DSpark：起草 | 0.50 → 0.42 | 0.56 → 0.48 | 0.78 → 0.66 | 1.07 → 0.88 |
+| DSpark：`--detail` 块的图 | 0.33 → 0.25 | 0.36 → 0.27 | 0.50 → 0.37 | 0.73 → 0.55 |
+| DSpark：一步合计 | 1.81 → 1.71 | 2.20 → 2.11 | 4.22 → 4.11 | 5.36 → 5.21 |
+
+- 拆解时每个并发只跑 1 次，那一遍的吞吐：EAGLE +4.1%、+2.7%、+3.5%、+0.8%，DSpark +3.6%、+3.3%、+3.4%、+5.8%。
+
+结果：
+
+- **起草每步少 0.06–0.18 ms，省下的都是图里的采样：** 拆解里，EAGLE 的起草少 6.5–10.4%，DSpark 少 14.4–17.3%。省下的几乎全在起草链和块的图里（EAGLE 0.07–0.16 ms，DSpark 0.08–0.19 ms），补算和图以外的部分基本不变。单独检查（3.14）：EAGLE 起草链的 kernel 从 135、141 个降到 93、99 个（batch 1、64），DSpark 的块从 93、92 个降到 42、41 个。
+- **贪心时省得更多：** 每步少 0.10–0.22 ms（EAGLE）和 0.11–0.27 ms（DSpark），吞吐提高 2.4–5.7% 和 4.5–6.9%。原来贪心的行也算整个 softmax 和噪声；现在只扫一遍 logits 取 argmax。单独检查：贪心的行一次 3–5 µs，采样的行 9–17 µs。
+- **temperature 1.0 时，吞吐提高 1.1–2.3%（EAGLE）和 1.5–5.0%（DSpark）：**
+  - 每步省 0.01–0.15 ms 和 0.06–0.14 ms，比拆解里少。差得最多的是并发 1 的 EAGLE：只快 1.4%，每步只少 0.01 ms，拆解里少 0.08 ms。
+  - 并发 1 时，同一配置的 3 次运行之间相差 1.7–7.5%，和要测的效果差不多大。单独检查（3.14）：对照和改动后交替跑 3 对，改动后每次都快 3.2–4.2%，每步少 0.05–0.08 ms，和拆解一致。
+- **DSpark 省得比 EAGLE 多：** DSpark 每个草稿的采样原来是 15 个 kernel（还有查 W₁ 以后的转换和 logits 转 fp32），现在是 3 个。它的一步也更短，省下同样的时间，占的比例更大。
+- **同一次测试里，DSpark 和 EAGLE 的差距缩小了一点：** temperature 1.0、γ = 4 时，改动后 DSpark 比 EAGLE 低 4.8%、0.1%、5.2%、5.6%，对照组里是 8.1%、2.3%、5.5%、5.0%。EAGLE 仍然更快。
+- **录图的显存少了：** EAGLE 从 118 MiB 降到 94 MiB，DSpark 从 128 MiB 降到 86 MiB：图里不再存每一步 fp32 的 logits、噪声和 softmax 的中间结果。显存峰值不变（DSpark 少 6 MiB，是改成 bf16 的 W₁）。
+
+**结论：** 把每个草稿的采样从十几个 PyTorch kernel 合成一个 Triton kernel 以后，EAGLE 起草链的图少了 42 个 kernel，DSpark 的块少了 51 个，temperature 1.0 时起草每步少 0.06–0.18 ms。贪心时每步少 0.10–0.27 ms，吞吐提高 2.4–6.9%；temperature 1.0 时提高 1.1–5.0%，因为采样的行还要写 q、生成随机数，省得少一些。剩下的起草时间主要是草稿模型本身：EAGLE 的 3 次一层前向和每一步 16,384 列的 logits，DSpark 的一层前向和 γ 行的 logits；DSpark 在 batch 1 时乘 W₂ 的 gemv 也比采样本身慢（3.14）。
 
 ## 3. 工程记录与设计决策
 
@@ -1633,7 +1709,7 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
   - 补算和验证步一样是打包的混合步，按 token 数分桶录图（3.9）。prefill 之后，草稿对整段 prompt 算一遍，用 prefill 的元数据，不录图。
 - **起草链录成一个图：**
   - γ 步连在一起，按 decode 的 batch 桶分别录图。每一步：16,384 个 token 的 logits → softmax → 采样或 argmax → 草稿模型在下一个位置的一步（decode 注意力）。
-  - 采样时把 q 除以独立的指数分布噪声再取 argmax，结果按 q 分布。这样采样只是几个逐元素的 kernel 加一次 argmax，整条链没有 CPU 同步，能录进图里。
+  - 采样时把 q 除以独立的指数分布噪声再取 argmax，结果按 q 分布。这样采样只是几个逐元素的 kernel 加一次 argmax，整条链没有 CPU 同步，能录进图里。E8c.1 起，每个草稿的采样合成一个 kernel（3.14）。
   - 每行的 temperature 放在静态缓冲区里，贪心的行取 argmax，所以 temperature 不同的请求共用一个图。
   - 草稿数受块数限制、少于 γ 时，起草链照样走满 γ 步，超出序列的块的位置写进池外面的那个块（同 3.2）。
   - q 写进一个 [batch, γ, 16,384] 的 fp32 缓冲区，每步复制一份交给下一步的验证；贪心时不复制。
@@ -1770,9 +1846,41 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 | DSpark 的块：batch 1 / 64 | 93 / 92 | 0.28 / 0.81 ms |
 
   - DSpark 的块里，batch 1 / 64 时 GPU 的时间：准备位置和槽位 15 个 kernel，0.02 / 0.02 ms；一层 block 和最后的 LayerNorm 12–13 个，0.06 / 0.32 ms（其中注意力 0.02 / 0.18 ms）；γ 行的 logits 2 个，0.04 / 0.15 ms；4 步 Markov 采样 63 个，0.15 / 0.30 ms。
-  - 块省掉的是补算，和起草链里 3 次一层的前向。每个草稿各自的采样（查 W₁、乘 W₂、softmax、指数噪声、argmax、写 token 和 q）两边都有，在块的图里占了 2/3 的 kernel，batch 1 时占一半多的 GPU 时间。
+  - 块省掉的是补算，和起草链里 3 次一层的前向。每个草稿各自的采样（查 W₁、乘 W₂、softmax、指数噪声、argmax、写 token 和 q）两边都有，在块的图里占了 2/3 的 kernel，batch 1 时占一半多的 GPU 时间。E8c.1 把它合成了一个 kernel（3.14）。
   - batch 64 时，一层 block 的时间主要在注意力：每条序列要读一遍上下文的 K/V，4 行一起读，和 EAGLE 起草链里 1 行读一次差不多（约 0.18 ms）。
 - **Markov head 的作用**（单独检查：把训练好的 W₂ 清零，在训练的验证窗口上重测）：第 1 个位置的接受率从 0.648 降到 0.406，第 2–8 个从 0.39–0.49 降到 0.20–0.26。第 1 行也降这么多，说明联合训练时，和前一个 token 有关的部分大多交给了 Markov head；不带 Markov head 训练的对照没有做。
+
+### 3.14 起草时的采样
+
+代码在 [minivllm/spec/draft_sampling.py](minivllm/spec/draft_sampling.py)，用在 [minivllm/model_runner.py](minivllm/model_runner.py) 的 `draft_chain`（EAGLE）和 `dspark_block`（DSpark）：
+
+- **每行一个程序：** 一行是一条序列的一个草稿，16,384 列。batch 小时程序少，但一次起草只有 γ 步，每步一个 kernel。把一行拆给几个程序要多一次归约（第二个 kernel 或原子操作），没有做。
+- **贪心的行不写 q：** 接受判断的两个 kernel 只在 temperature > 0 的行上用 q（E8b.1），top-k、top-p 的完整路径里贪心的行也不用。所以贪心的行只扫一遍 logits 取 argmax，ch_probs 里那一行留着旧值。
+- **采样仍用指数分布的竞争：** argmin(E / q) 选中每个 token 的概率正好是 q。逆 CDF（前缀和）每行只要一个随机数，但 q 很小的 token 在 fp32 的累加里会被舍入，起草的分布和交给接受判断的 q 就不完全一致了。
+- **随机数是采样的行的主要开销**（单独检查：一个图里连续调用 4 次，16,384 列，带 Markov 项，每次调用的时间）：
+
+| | 1 行 | 8 行 | 64 行 |
+|---|---|---|---|
+| 贪心的行 | 3.2 µs | 3.2 µs | 4.7 µs |
+| 采样的行，每个 token 调一次 Philox | 12.3 µs | 13.1 µs | 24.3 µs |
+| 采样的行，一次调用出 4 个（现在） | 9.2 µs | 9.2 µs | 16.9 µs |
+
+  - 采样的行要扫两遍、写 q，还要给每个 token 一个随机数。Philox 每次调用算 10 轮，原来每个 token 调一次，1 行时全压在一个 SM 上。`tl.rand4x` 一次调用给出 4 个 32 位随机数，调用次数降到 1/4。
+  - 把除法换成乘倒数、把竞争换成比较 log E − logits / t（和 E / q 同序），反而更慢（9.9、10.5、19.0 µs）：Triton 的 fp32 除法本来就是快速的近似除法，两次 log 比一次除法贵。
+  - tile 按行数选：不超过 16 行时一次装下一整行（16,384 列，16 个 warp），更多行时每次 4096 列、8 个 warp。上表就是这两种配置；按 1、8、64 行扫过 2048–16,384 列和 4–32 个 warp。
+- **种子：** GPU 上的一个 int64，每次起草开始时在图里用 `random_` 重抽。PyTorch 录图时把随机数生成器的 offset 变成图的输入，每次回放自动前进，所以每次回放的种子都不同，而 `torch.manual_seed` 又能固定整个序列（test_spec 检查了这两点）。一次起草的 γ 步共用一个种子，Philox 的计数器按步、行和列分开。
+- **改动前后的图**（单独检查，方法同 3.13：γ = 4，每条序列上下文 512 个 token，temperature 1.0）：
+
+| 图 | kernel 数 | 墙钟 |
+|---|---|---|
+| EAGLE 的起草链，batch 1 / 64 | 135 → 93 / 141 → 99 | 0.42 → 0.35 / 1.23 → 1.07 ms |
+| DSpark 的块，batch 1 / 64 | 93 → 42 / 92 → 41 | 0.28 → 0.21 / 0.81 → 0.58 ms |
+
+  - 采样 kernel 一次 8.7–9.1 µs（batch 1）、16.4–17.3 µs（batch 64）。
+  - DSpark 每个草稿剩 3 个 kernel：查 W₁、乘 W₂、采样。batch 1 时乘 W₂（[1, 64] × [64, 16,384]）的 gemv 要 11–13 µs，比采样还慢：读一遍 2 MiB 的 W₂，按显存带宽只要 3.4 µs。
+- **在引擎里**（单独检查，W4，temperature 1.0）：
+  - 换 6 个种子比较并发 1 时每步的 token 数，改动前后的均值相差不超过 0.02（DSpark 2.261 对 2.244，EAGLE 2.758 对 2.742）；同一份代码换个种子就能差 0.02–0.07。
+  - 并发 1 的 EAGLE，对照和改动后交替跑 3 对，每次 3 遍取中位数：对照 1319、1341、1374 token/s，改动后 1374、1397、1418 token/s，每一对都快 3.2–4.2%；每步 2.06 → 1.98、2.01 → 1.95、1.98 → 1.93 ms。这段时间里两边都在慢慢变快（对照从 1319 到 1374），所以对照组要放在改动的前后。
 
 ## 4. 实验列表
 
@@ -1794,6 +1902,7 @@ prefill 是一个 kernel，每条序列可以有任意多个新 token：
 | E8b.1 | 接受判断改成两个融合的 Triton kernel（不存任何一行的完整分布；top-k、top-p 仍走原来的路径） | 改动前的代码（`4f14c0a`） | 接受判断单独测；W4，temperature 1.0 和贪心，并发 1、8、32、64 | 已完成：temperature 1.0 下接受判断快 2.8–9.0 倍，EAGLE 吞吐提高 14–19%，相对不投机 +24–54%；贪心不变，见第 2 节 |
 | E8b.2 | 验证步之后，EAGLE 补算和起草链的输入由一个 Triton kernel 在 GPU 上写好；验证前给起草链预分块 | 改动前的代码（`f9a5b01`） | W4，temperature 1.0 和贪心，并发 1、8、32、64；拆解 | 已完成：起草每步少 0.29–0.43 ms；temperature 1.0 下 EAGLE 吞吐提高 3–10%，相对不投机 +26–67%；贪心每步快 0.27–0.31 ms，见第 2 节 |
 | E8c | DSpark 式草稿模型（`spec="dspark"`）：一层 GPT-2 block 一次前向起草一整段，上下文 K/V 在目标模型的前向里注入，加秩 64 的 Markov head；每步 3、4 个草稿 | E8b 的 EAGLE（γ = 3、4），同一次测试；不用投机解码 | W4，temperature 1.0，并发 1、8、32、64；拆解 | 已完成：每个并发取最好的 γ，比 EAGLE 慢 2–9%，比不投机快 17–44%；起草每步省 31–44%，但每步的 token 少 14–19%，见第 2 节 |
+| E8c.1 | 每个草稿的采样合成一个 Triton kernel（EAGLE 的起草链、DSpark 的块），贪心的行只取 argmax | 改动前的代码（`b56fbdc`） | W4，temperature 1.0 和贪心，并发 1、8、32、64；拆解 | 已完成：起草每步少 0.06–0.18 ms；贪心时吞吐提高 2.4–6.9%，temperature 1.0 时 1.1–5.0%，见第 2 节 |
 | E8d | 置信度调度：按预测的接受概率和并发选验证长度 | 固定验证长度 | W4，并发 1–64 | 待做 |
 | E9 | 融合逐元素的 kernel（`fused_kernels=True`）：每层的 norm、RoPE、写 KV、残差相加和 SiLU × up 合成 5 个 Triton kernel | 原来的写法（`--no-fused-kernels`），同一份代码 | 图里的 kernel；单步 decode；W1；W4，temperature 1.0，并发 1、8、32、64；拆解 | 已完成：decode 图的 kernel 从 1525 个降到 282 个（Qwen3），每步省 1.5–2.1 ms；W1 吞吐提高 18.2%，prefill 步快 36%；W4 上不投机快 31–39%、EAGLE 快 28–33%，不录图的 prefill 步快约一倍，见第 2 节 |
 | E10 | 不分块时，512 个 token 以内的 prefill 步补齐到 token 桶、录 CUDA graph（`prefill_graph_tokens=512`）；EAGLE 草稿的 prefill 也录图 | prefill 都不录图（`--prefill-graph-tokens 0`），同一份代码 | W4，temperature 1.0，并发 1、8、32、64；W1 | 已完成：W4 的 prefill 步快 21–36%，并发 8–64 时吞吐提高 3.4–6.2%，ITL 的 p99 降低 15–31%；W1 不变（+0.16%），见第 2 节 |
