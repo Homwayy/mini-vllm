@@ -18,6 +18,8 @@ acceptance given the earlier ones were.
 
 Run from the repo root, e.g.:
     python train_dspark.py --out checkpoints/gpt2_dspark.pt --log results/e8c_train.json
+or, with two draft blocks (E8c.2):
+    python train_dspark.py --n-layer 2 --out checkpoints/gpt2_dspark2.pt --log results/e8c2_train.json
 """
 
 import argparse
@@ -137,6 +139,7 @@ def main():
     ap.add_argument("--draft-vocab", type=int, default=16384, help="the most frequent tokens of the training split")
     ap.add_argument("--block-len", type=int, default=8, help="rows per block; drafting can use fewer")
     ap.add_argument("--rank", type=int, default=64, help="rank of the Markov head")
+    ap.add_argument("--n-layer", type=int, default=1, help="GPT-2 blocks in the draft model")
     ap.add_argument("--steps", type=int, default=10000)
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--seq-len", type=int, default=1024)
@@ -163,7 +166,7 @@ def main():
     draft_index = torch.full((target.cfg.vocab_size,), -1, dtype=torch.long, device=device)
     draft_index[torch.as_tensor(vocab_ids, device=device)] = torch.arange(len(vocab_ids), device=device)
 
-    draft = DSparkDraft(target.cfg, None, vocab_ids, args.block_len, args.rank)
+    draft = DSparkDraft(target.cfg, None, vocab_ids, args.block_len, args.rank, n_layer=args.n_layer)
     draft.to(device)
     draft.attach(target)
     params = [p for p in draft.parameters() if p.requires_grad]

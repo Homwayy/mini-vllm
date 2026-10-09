@@ -162,10 +162,10 @@ class ModelRunner:
             path = cfg.draft_path or os.path.join("checkpoints", f"gpt2_{cfg.spec}.pt")
             self.draft = (load_eagle if cfg.spec == "eagle" else load_dspark)(path, self.model, attn, device)
             self.draft.fused = cfg.fused_kernels
-            a = self.draft.block.attn
-            a.k_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
-            a.v_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
-            self.kv_bytes += 2 * a.k_cache.numel() * a.k_cache.element_size()
+            for a in self.draft.attn_layers:
+                a.k_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
+                a.v_cache = torch.empty(shape, dtype=torch.bfloat16, device=device)
+                self.kv_bytes += 2 * a.k_cache.numel() * a.k_cache.element_size()
             d, s, g = self.model.cfg.n_embd, self.buckets[-1], cfg.num_spec_tokens
             self.ch_pos = torch.zeros(s, dtype=torch.int64, device=device)
             self.ch_temp = torch.zeros(s, dtype=torch.float32, device=device)

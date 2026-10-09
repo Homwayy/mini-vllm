@@ -39,6 +39,11 @@ class EagleDraft(nn.Module):
         rows = target.lm_head_weight[self.vocab_ids.to(target.lm_head_weight.device)]
         self.target = (target.wte, target.cos, target.sin, rows)
 
+    @property
+    def attn_layers(self):
+        """The attention modules that need a KV pool in the engine."""
+        return [self.block.attn]
+
     def init_as_copy(self):
         """Starts near g_t = f_t: the feature half of fc is the identity, and the block adds only the biases of
         its two output projections, whose weights are zero."""

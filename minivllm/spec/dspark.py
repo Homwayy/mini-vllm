@@ -1,9 +1,10 @@
 """DSpark-style draft model for the GPT-2 target (E8c): a block of drafts in one forward, plus a Markov head.
 
 A block has one row per draft. Row 0 is the anchor, the last token, whose target features are not known yet; the
-other rows are mask rows at the following positions. The rows run through one GPT-2 block, attending causally to
-each other and to K/V computed from the target's features at every earlier position (KV injection): its hidden
-states at the inputs of blocks feature_layers and its final hidden state, concatenated and projected. Row k gives
+other rows are mask rows at the following positions. The rows run through n_layer GPT-2 blocks (one in E8c),
+attending causally to each other and to K/V computed from the target's features at every earlier position (KV
+injection): its hidden states at the inputs of blocks feature_layers and its final hidden state, concatenated and
+projected. As in DFlash and DSpark, every block gets its own K/V of the same projected features. Row k gives
 base logits U_k for the token at the anchor's position + k + 1, through the target's frozen LM head rows of the
 draft vocabulary. Attention inside the block is causal, so a model trained with block_len rows drafts any
 shorter block exactly as it would the first rows of a full one.
@@ -34,7 +35,8 @@ FEATURE_LAYERS = (4, 8)  # with the final hidden state: low, middle and last lay
 
 
 class DSparkDraft(nn.Module):
-    def __init__(self, cfg: GPT2Config, attn_backend, vocab_ids, block_len=8, rank=64, feature_layers=FEATURE_LAYERS):
+    def __init__(self, cfg: GPT2Config, attn_backend, vocab_ids, block_len=8, rank=64, feature_layers=FEATURE_LAYERS,
+                 n_layer=1):
         super().__init__()
         d = cfg.n_embd
         self.n_head = cfg.n_head
@@ -42,7 +44,7 @@ class DSparkDraft(nn.Module):
         self.feature_layers = tuple(feature_layers)
         self.fc = nn.Linear((len(self.feature_layers) + 1) * d, d)
         self.row_emb = nn.Parameter(0.02 * torch.randn(block_len, d))  # added to row k; row 0 also gets the anchor's embedding
-        self.block = GPT2Block(cfg, attn_backend)
+        self.blocks = nn.ModuleList(GPT2Block(cfg, attn_backend) for _ in range(n_layer))
         self.ln_out = nn.LayerNorm(d)
         self.markov_in = nn.Embedding(cfg.vocab_size, rank)  # W1, indexed by the previous token
         self.markov_out = nn.Linear(rank, len(vocab_ids), bias=False)  # W2, onto the draft vocabulary
@@ -57,6 +59,11 @@ class DSparkDraft(nn.Module):
         rows = target.lm_head_weight[self.vocab_ids.to(target.lm_head_weight.device)]
         self.target = (target.wte, target.cos, target.sin, rows)
 
+    @property
+    def attn_layers(self):
+        """The attention modules that need a KV pool in the engine."""
+        return [blk.attn for blk in self.blocks]
+
     def context(self, features):
         """features: the target's hidden states at the inputs of feature_layers, then its final one ([..., d]
         each). Returns the vectors whose K/V the block reads, [..., d] fp32."""
@@ -64,18 +71,19 @@ class DSparkDraft(nn.Module):
         return self.fc(x).float()
 
     def inject(self, features, positions, meta: AttnMetadata):
-        """Writes the context K/V of the target's rows [T] into the draft's pool, at meta.slot_mapping."""
+        """Writes the context K/V of the target's rows [T] into each block's pool, at meta.slot_mapping."""
         _, cos, sin, _ = self.target
-        attn, ln = self.block.attn, self.block.ln_1
         c = self.context(features)
-        dtype = attn.c_attn.weight.dtype
-        if self.fused:  # q is computed and dropped
-            fused.rope_store(attn.c_attn(fused.add_layer_norm(c, None, ln, dtype)), attn.num_heads, positions, cos, sin,
-                             attn.k_cache, attn.v_cache, meta.slot_mapping, False)
-            return
-        _, k, v = attn.c_attn(ln(c).to(dtype)).view(c.shape[0], 3, attn.num_heads, attn.head_dim).unbind(1)
-        k = apply_rope(k, cos[positions].unsqueeze(1), sin[positions].unsqueeze(1))
-        store_kv(k, v, attn.k_cache, attn.v_cache, meta.slot_mapping)
+        for blk in self.blocks:
+            attn, ln = blk.attn, blk.ln_1
+            dtype = attn.c_attn.weight.dtype
+            if self.fused:  # q is computed and dropped
+                fused.rope_store(attn.c_attn(fused.add_layer_norm(c, None, ln, dtype)), attn.num_heads, positions, cos, sin,
+                                 attn.k_cache, attn.v_cache, meta.slot_mapping, False)
+                continue
+            _, k, v = attn.c_attn(ln(c).to(dtype)).view(c.shape[0], 3, attn.num_heads, attn.head_dim).unbind(1)
+            k = apply_rope(k, cos[positions].unsqueeze(1), sin[positions].unsqueeze(1))
+            store_kv(k, v, attn.k_cache, attn.v_cache, meta.slot_mapping)
 
     def rows(self, anchors, n):
         """The inputs of n rows per anchor, [len(anchors) * n, d] fp32."""
@@ -88,10 +96,10 @@ class DSparkDraft(nn.Module):
         and attention reads the context there. Returns h [P * n, d] fp32."""
         _, cos, sin, _ = self.target
         x = self.rows(anchors, positions.shape[0] // anchors.shape[0])
-        if self.fused:
-            x = self.block.forward_fused(x, positions, cos, sin, meta)
-        else:
-            x = self.block(x, cos[positions].unsqueeze(1), sin[positions].unsqueeze(1), meta)
+        if not self.fused:
+            c, s = cos[positions].unsqueeze(1), sin[positions].unsqueeze(1)
+        for blk in self.blocks:
+            x = blk.forward_fused(x, positions, cos, sin, meta) if self.fused else blk(x, c, s, meta)
         return self.ln_out(x)
 
     def logits(self, h):
@@ -114,21 +122,22 @@ class DSparkDraft(nn.Module):
         n, H = self.block_len, self.n_head
         D = d // H
         wte, cos, sin, _ = self.target
-        blk = self.block
         pos = torch.arange(T, device=ids.device)
-        _, kc, vc = blk.attn.c_attn(blk.ln_1(self.context(features))).view(B, T, 3, H, D).unbind(2)
-        kc = apply_rope(kc, cos[pos].unsqueeze(1), sin[pos].unsqueeze(1))
+        ctx = self.context(features)
         x = self.row_emb[:, None, :].float() + torch.zeros(B, n, T, d, device=ids.device)
         x[:, 0] += wte(ids)
         rpos = (pos[None, :] + torch.arange(n, device=ids.device)[:, None]).clamp(max=T - 1)  # rows past the window have no loss
         c, s = cos[rpos].unsqueeze(2), sin[rpos].unsqueeze(2)
-        q, kb, vb = blk.attn.c_attn(blk.ln_1(x)).view(B, n, T, 3, H, D).unbind(3)
-        q, kb = apply_rope(q, c, s), apply_rope(kb, c, s)
-        o = flex(q.reshape(B, n * T, H, D).transpose(1, 2),
-                 torch.cat([kc, kb.reshape(B, n * T, H, D)], 1).transpose(1, 2),
-                 torch.cat([vc, vb.reshape(B, n * T, H, D)], 1).transpose(1, 2), block_mask=block_mask)
-        x = x + blk.attn.c_proj(o.transpose(1, 2).reshape(B, n, T, d))
-        x = x + blk.mlp(blk.ln_2(x))
+        for blk in self.blocks:
+            _, kc, vc = blk.attn.c_attn(blk.ln_1(ctx)).view(B, T, 3, H, D).unbind(2)
+            kc = apply_rope(kc, cos[pos].unsqueeze(1), sin[pos].unsqueeze(1))
+            q, kb, vb = blk.attn.c_attn(blk.ln_1(x)).view(B, n, T, 3, H, D).unbind(3)
+            q, kb = apply_rope(q, c, s), apply_rope(kb, c, s)
+            o = flex(q.reshape(B, n * T, H, D).transpose(1, 2),
+                     torch.cat([kc, kb.reshape(B, n * T, H, D)], 1).transpose(1, 2),
+                     torch.cat([vc, vb.reshape(B, n * T, H, D)], 1).transpose(1, 2), block_mask=block_mask)
+            x = x + blk.attn.c_proj(o.transpose(1, 2).reshape(B, n, T, d))
+            x = x + blk.mlp(blk.ln_2(x))
         return self.ln_out(x)
 
 
@@ -168,10 +177,12 @@ def block_inputs_kernel(pos_ptr, cu_ptr, bt_ptr, bt_stride, bt_width, accepted_p
 def load_dspark(path, target, attn_backend, device="cuda", dtype=torch.bfloat16):
     ckpt = torch.load(path, map_location="cpu")
     a = ckpt["args"]
-    draft = DSparkDraft(target.cfg, attn_backend, ckpt["vocab_ids"], a["block_len"], a["rank"], ckpt["feature_layers"])
-    draft.load_state_dict(ckpt["draft"])
+    draft = DSparkDraft(target.cfg, attn_backend, ckpt["vocab_ids"], a["block_len"], a["rank"], ckpt["feature_layers"],
+                        a.get("n_layer", 1))
+    # checkpoints from before n_layer have their one block as "block"
+    draft.load_state_dict({"blocks.0." + k[len("block."):] if k.startswith("block.") else k: v for k, v in ckpt["draft"].items()})
     # markov_in's rows are cast before use anyway, so a bf16 table saves a cast per draft
-    for m in (draft.fc, draft.block.attn, draft.block.mlp, draft.markov_in, draft.markov_out, draft.conf):
+    for m in (draft.fc, *draft.attn_layers, *(blk.mlp for blk in draft.blocks), draft.markov_in, draft.markov_out, draft.conf):
         m.to(dtype)
     draft.to(device)
     draft.attach(target)
