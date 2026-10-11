@@ -137,3 +137,5 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/jso
 | [EXPERIMENTS.md](EXPERIMENTS.md) | 完整的实验记录 |
 
 设计参考了 [vLLM](https://github.com/vllm-project/vllm) 和 [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm)；草稿模型参考了 [EAGLE](https://arxiv.org/abs/2401.15077) 和 DSpark（arXiv 2607.05147）。
+
+许可证：MIT，见 [LICENSE](LICENSE)。
