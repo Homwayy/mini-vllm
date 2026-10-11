@@ -1,0 +1,10 @@
+# PyTorch is installed separately (RTX 50-series GPUs need CUDA 12.8+):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+# On Windows, Triton comes from triton-windows:
+#   pip install -U "triton-windows<3.7"
+numpy
+transformers
+safetensors
+tiktoken
+aiohttp
+matplotlib
