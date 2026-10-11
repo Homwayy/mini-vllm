@@ -135,3 +135,12 @@ class Scheduler:
         self.running.remove(seq)
         if not self.running:
             self.filling = True
+
+    def abort(self, seq: Sequence):
+        """Drops seq between steps: a running one releases its blocks as if it had finished; a waiting one holds
+        none (a preempted sequence released them)."""
+        if seq.status == Status.RUNNING:
+            self.finish(seq)
+        elif seq.status == Status.WAITING:
+            self.waiting.remove(seq)
+            seq.status = Status.FINISHED

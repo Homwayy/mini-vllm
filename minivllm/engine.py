@@ -42,6 +42,20 @@ class EngineConfig:
     max_model_len: int = 2048
 
 
+def check_request(cfg: EngineConfig, n: int, params: SamplingParams):
+    """Raises ValueError if the engine cannot run a request with an n-token prompt."""
+    if n == 0:
+        raise ValueError("the prompt is empty")
+    if params.max_tokens < 1:
+        raise ValueError("max_tokens must be at least 1")
+    if n + params.max_tokens > cfg.max_model_len:
+        raise ValueError(f"prompt ({n}) + max_tokens ({params.max_tokens}) exceeds max_model_len {cfg.max_model_len}")
+    if n > cfg.max_num_batched_tokens and not cfg.chunked_prefill:
+        raise ValueError(f"prompt ({n}) exceeds max_num_batched_tokens {cfg.max_num_batched_tokens}")
+    if cdiv(n + params.max_tokens, cfg.block_size) > cfg.num_kv_blocks:
+        raise ValueError("request does not fit in the KV pool")
+
+
 @dataclass
 class StepRecord:
     start: float
@@ -95,17 +109,17 @@ class LLMEngine:
         self.steps: list[StepRecord] = []
 
     def add_request(self, prompt_token_ids, params: SamplingParams, arrival_time=None) -> Sequence:
-        cfg = self.cfg
-        n = len(prompt_token_ids)
-        if n + params.max_tokens > cfg.max_model_len:
-            raise ValueError(f"prompt ({n}) + max_tokens ({params.max_tokens}) exceeds max_model_len {cfg.max_model_len}")
-        if n > cfg.max_num_batched_tokens and not cfg.chunked_prefill:
-            raise ValueError(f"prompt ({n}) exceeds max_num_batched_tokens {cfg.max_num_batched_tokens}")
-        if cdiv(n + params.max_tokens, cfg.block_size) > cfg.num_kv_blocks:
-            raise ValueError("request does not fit in the KV pool")
+        check_request(self.cfg, len(prompt_token_ids), params)
         seq = Sequence(prompt_token_ids, params, time.perf_counter() if arrival_time is None else arrival_time)
         self.scheduler.add(seq)
         return seq
+
+    def abort_request(self, seq: Sequence):
+        """Stops seq before it finishes (its client went away, or it hit a stop string); call between steps. Its
+        tokens so far stay in seq."""
+        if seq.status != Status.FINISHED:
+            self.scheduler.abort(seq)
+            seq.finish_time = time.perf_counter()
 
     def has_unfinished(self):
         return self.scheduler.has_unfinished()
