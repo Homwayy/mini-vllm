@@ -47,6 +47,7 @@ from minivllm.attention.triton_paged import TritonAttention, prefill_block_m
 from minivllm.kv_manager import cdiv
 from minivllm.models.gpt2 import load_gpt2
 from minivllm.models.qwen3 import load_qwen3
+from minivllm.paths import GPT2_CKPT
 from minivllm.sampler import Sampler
 from minivllm.sequence import Sequence
 from minivllm.spec.draft_sampling import sample_drafts
@@ -56,7 +57,7 @@ from minivllm.spec.rejection import verify_drafts
 
 MODELS = {
     "qwen3": dict(path=os.path.join("checkpoints", "Qwen3-0.6B"), eos=(151643, 151645), vocab_limit=None),
-    "gpt2": dict(path=r"A:\GitHub project\nanoGPT\out\final\ckpt.pt", eos=(50256,), vocab_limit=50257),
+    "gpt2": dict(path=GPT2_CKPT, eos=(50256,), vocab_limit=50257),
 }
 
 

@@ -18,11 +18,13 @@ import os
 
 import numpy as np
 
+from minivllm.paths import FINEWEB_EDU_DIR
+
 OUT_DIR = os.path.join("bench", "workloads")
 SEED = 0
 TOKEN_ID_HIGH = 10000
 SAMPLING = {"temperature": 0.6, "ignore_eos": True}
-NANOGPT_VAL = r"A:\GitHub project\nanoGPT\data\fineweb_edu\val.bin"  # uint16 tokens, each document after an EOT
+NANOGPT_VAL = os.path.join(FINEWEB_EDU_DIR, "val.bin")  # uint16 tokens, each document after an EOT
 GPT2_EOT = 50256
 
 

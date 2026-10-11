@@ -32,9 +32,10 @@ import torch.nn.functional as F
 from minivllm.attention import AttnMetadata
 from minivllm.model_runner import MODELS
 from minivllm.models.gpt2 import load_gpt2
+from minivllm.paths import FINEWEB_EDU_DIR
 from minivllm.spec.eagle import EagleDraft
 
-DATA = r"A:\GitHub project\nanoGPT\data\fineweb_edu"
+DATA = FINEWEB_EDU_DIR
 REAL_VOCAB = 50257  # ids from here up pad GPT-2's embedding to 50304
 
 

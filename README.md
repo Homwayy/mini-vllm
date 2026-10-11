@@ -113,7 +113,7 @@ curl http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/jso
   -d '{"messages": [{"role": "user", "content": "Name three colors."}], "max_tokens": 64, "chat_template_kwargs": {"enable_thinking": false}}'
 ```
 
-- **GPT-2 的实验（E8）：** 用 nanoGPT 项目（[Homwayy/nanoGPT](https://github.com/Homwayy/nanoGPT)）训练的 checkpoint 和它准备的 FineWeb-Edu 数据，路径写在 [minivllm/model_runner.py](minivllm/model_runner.py) 的 `MODELS` 和 [train_draft.py](train_draft.py) 的 `DATA` 里。草稿模型用 `python train_draft.py --out checkpoints/gpt2_eagle.pt --log eagle_train.json` 训练；投机解码的基准测试，例如 `python -m bench.bench_spec --spec eagle --num-spec-tokens 4 --temperature 1.0 --out results/w4_eagle.json`。
+- **GPT-2 的实验（E0、E8）：** 用 nanoGPT 项目（[Homwayy/nanoGPT](https://github.com/Homwayy/nanoGPT)）训练的 checkpoint（`out/final/ckpt.pt`）和它准备的 FineWeb-Edu 数据（`data/fineweb_edu/`）。nanoGPT 默认放在这个仓库的旁边（`../nanoGPT`），放在别处时设置环境变量 `NANOGPT_DIR`（见 [minivllm/paths.py](minivllm/paths.py)）。草稿模型用 `python train_draft.py --out checkpoints/gpt2_eagle.pt --log eagle_train.json` 训练；投机解码的基准测试，例如 `python -m bench.bench_spec --spec eagle --num-spec-tokens 4 --temperature 1.0 --out results/w4_eagle.json`。
 - **画图：** `python figures/plot.py`，数据都从 results/ 读。
 
 ## 目录

@@ -24,14 +24,14 @@ import sys
 import torch
 
 from minivllm.models.gpt2 import load_gpt2
+from minivllm.paths import GPT2_CKPT, NANOGPT_DIR
 from minivllm.utils import cap_gpu_memory
 from tests.common import EOT, attention_from_args, logit_stats, print_stats, run_ours, val_documents
 
-NANOGPT = r"A:\GitHub project\nanoGPT"
-sys.path.insert(0, os.path.join(NANOGPT, "transformer"))
+sys.path.insert(0, os.path.join(NANOGPT_DIR, "transformer"))
 from model import GPT, GPTConfig  # noqa: E402
 
-CKPT = os.path.join(NANOGPT, "out", "final", "ckpt.pt")
+CKPT = GPT2_CKPT
 PROMPT_LENS = [17, 120, 517, 896]  # the longest prompt plus NEW_TOKENS fills the 1024 context
 NEW_TOKENS = 128
 BLOCK_SIZE = 16

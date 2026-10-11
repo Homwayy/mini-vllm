@@ -1,6 +1,7 @@
 """Helpers shared by the correctness tests: a scattered block layout, packed prefill and batched greedy decode."""
 
 import argparse
+import os
 import random
 
 import numpy as np
@@ -10,8 +11,9 @@ from minivllm.attention import AttnMetadata
 from minivllm.attention.flex import FlexAttention
 from minivllm.attention.gather import GatherAttention
 from minivllm.attention.triton_paged import TritonAttention
+from minivllm.paths import FINEWEB_EDU_DIR
 
-VAL_BIN = r"A:\GitHub project\nanoGPT\data\fineweb_edu\val.bin"
+VAL_BIN = os.path.join(FINEWEB_EDU_DIR, "val.bin")
 EOT = 50256  # GPT-2 <|endoftext|>, placed before every document in val.bin
 
 
