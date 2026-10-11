@@ -11,7 +11,7 @@ waits for /health, and stops it at the end, so one command measures a whole conf
 it takes the server's step records (GET /debug/steps) for the engine-side numbers: decode step time, batch.
 
 Run from the repo root, e.g.:
-    python -m bench.bench_http --launch --rates 1 2 4 8 inf --out results/e11_http_online.json
+    python -m bench.bench_http --launch --rates 1 2 4 8 inf --out results/e11_http_process.json
 """
 
 import argparse
@@ -162,7 +162,8 @@ def main():
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--model-name", default=None, help="the served model name to send (optional)")
     ap.add_argument("--launch", action="store_true", help="start the server here, and stop it at the end")
-    ap.add_argument("--server-args", default="", help="more arguments for python -m minivllm.server, as one string")
+    ap.add_argument("--engine-thread", action="store_true", help="with --launch: the server runs the engine in a thread (E11), not its own process")
+    ap.add_argument("--server-args", default="", help="more arguments for python -m minivllm.server, as one string (--server-args=\"...\")")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -171,7 +172,7 @@ def main():
     arrivals = w["arrival_times_rate1"][: len(reqs)]
     base = f"http://{args.host}:{args.port}"
     server_args = ["--host", args.host, "--port", str(args.port), "--warmup-temperature", str(w["sampling"]["temperature"]),
-                   "--record-steps", *shlex.split(args.server_args)]
+                   "--record-steps", *(["--engine-thread"] if args.engine_thread else []), *shlex.split(args.server_args)]
     proc = None
     if args.launch:
         proc = subprocess.Popen([sys.executable, "-m", "minivllm.server", *server_args])

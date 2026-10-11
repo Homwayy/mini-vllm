@@ -1,8 +1,9 @@
 """An OpenAI-compatible HTTP server for the engine (E11).
 
 POST /v1/completions and /v1/chat/completions, streamed as server-sent events or returned whole; GET /v1/models
-and /health. The engine runs in its own thread (minivllm/async_engine.py). The handlers run in an aiohttp
-event loop: each decodes the tokens its request gets in a step (IncrementalDetokenizer) and writes one event.
+and /health. The engine runs in a process of its own, or with --engine-thread in a thread of this one
+(minivllm/async_engine.py). The handlers run in an aiohttp event loop: each decodes the tokens its request
+gets in a step (IncrementalDetokenizer) and writes one event.
 
 - prompt: a string or a list of token ids (completions); messages with text content (chat; Qwen3 only, with
   its chat template; chat_template_kwargs are passed on, e.g. {"enable_thinking": false}).
@@ -24,7 +25,7 @@ import uuid
 
 from aiohttp import web
 
-from minivllm.async_engine import AsyncEngine
+from minivllm.async_engine import EngineClient, ProcessEngine, ThreadEngine
 from minivllm.engine import EngineConfig
 from minivllm.model_runner import MODELS
 from minivllm.sequence import SamplingParams
@@ -171,7 +172,7 @@ async def generate(request, body, ids, params, stop, chat):
 
     try:
         req = engine.add_request(ids, params)
-    except RuntimeError as e:
+    except (RuntimeError, OSError) as e:  # the engine stopped
         return error_response(str(e), 500)
 
     if not body.get("stream"):
@@ -184,7 +185,9 @@ async def generate(request, body, ids, params, stop, chat):
                 if hit:
                     reason = "stop"
                     break
-        except RuntimeError as e:
+        except ValueError as e:  # the engine rejected the request
+            return error_response(str(e), 400)
+        except RuntimeError as e:  # the engine stopped
             return error_response(str(e), 500)
         finally:
             engine.abort(req)  # a stop string, or the client went away; nothing if the request finished
@@ -227,8 +230,8 @@ async def generate(request, body, ids, params, stop, chat):
         await resp.write_eof()
     except ConnectionError:  # the client went away
         pass
-    except RuntimeError as e:  # the engine stopped in the middle of the stream
-        await resp.write(f"data: {dumps({'error': {'message': str(e), 'type': 'InternalServerError', 'code': 500}})}\n\n".encode())
+    except (RuntimeError, ValueError) as e:  # the engine stopped, or rejected the request
+        await resp.write(f"data: {dumps({'error': {'message': str(e), 'code': 500 if isinstance(e, RuntimeError) else 400}})}\n\n".encode())
     finally:
         engine.abort(req)
     return resp
@@ -249,11 +252,10 @@ async def health(request):
 async def debug_steps(request):
     """The engine's step records since the last call, for benchmarks (--record-steps): [start, end (perf_counter
     seconds, comparable across processes on Windows), is_prefill, sequences, tokens, decoding sequences]."""
-    steps = request.app["engine"].take_steps()
-    return web.json_response({"steps": [[r.start, r.end, r.is_prefill, r.num_seqs, r.num_tokens, r.num_decode] for r in steps]})
+    return web.json_response({"steps": await request.app["engine"].query("steps")})
 
 
-def make_app(engine: AsyncEngine, tokenizer: Tokenizer, model_name: str) -> web.Application:
+def make_app(engine: EngineClient, tokenizer: Tokenizer, model_name: str) -> web.Application:
     app = web.Application(client_max_size=64 << 20)
     app["engine"], app["tokenizer"], app["model_name"], app["created"] = engine, tokenizer, model_name, int(time.time())
     app.router.add_post("/v1/completions", completions)
@@ -290,6 +292,7 @@ def main():
     ap.add_argument("--max-model-len", type=int, default=d.max_model_len)
     ap.add_argument("--warmup-temperature", type=float, default=0.6, help="temperature of the warm-up requests; negative: no warm-up")
     ap.add_argument("--record-steps", action="store_true", help="keep every step's record for GET /debug/steps (benchmarks)")
+    ap.add_argument("--engine-thread", action="store_true", help="run the engine in a thread of the server's process (E11), not its own")
     args = ap.parse_args()
 
     cfg = EngineConfig(
@@ -300,7 +303,8 @@ def main():
         max_num_seqs=args.max_num_seqs, max_num_batched_tokens=args.max_num_batched_tokens, max_model_len=args.max_model_len,
     )
     tokenizer = Tokenizer(cfg.model, cfg.model_path or MODELS[cfg.model]["path"])
-    engine = AsyncEngine(cfg, args.warmup_temperature if args.warmup_temperature >= 0 else None, args.record_steps)
+    engine = (ThreadEngine if args.engine_thread else ProcessEngine)(
+        cfg, args.warmup_temperature if args.warmup_temperature >= 0 else None, args.record_steps)
     name = args.served_model_name or cfg.model
     print(f"{cfg}\nserving {name} at http://{args.host}:{args.port}", flush=True)
     web.run_app(make_app(engine, tokenizer, name), host=args.host, port=args.port, access_log=None, print=None)

@@ -1,4 +1,4 @@
-"""The HTTP server (minivllm/server.py) end to end, on Qwen3 with a small engine in this process.
+"""The HTTP server (minivllm/server.py) end to end, on Qwen3 with a small engine.
 
 - Greedy text: a request on its own gets exactly the text of the same prompt run on its own in
   LLMEngine.generate (both at batch 1, so the same kernels), streamed or not; the streamed deltas add up to
@@ -8,6 +8,7 @@
 - A stop string cuts the text before its first occurrence (finish_reason "stop"), streamed or not, and the
   request is aborted in the engine. A client that disconnects mid-stream gets its request aborted too.
 - Chat completions (Qwen3's template), /v1/models, /health, and requests the server must reject.
+- Both ways of running the engine: in its own process (the default) and in a thread of the server's.
 - The incremental detokenizer and the stop checker: random token ids, in random pieces, give the same text
   as decoding them at once (Qwen3 and GPT-2 tokenizers).
 
@@ -23,7 +24,7 @@ import aiohttp
 import torch
 from aiohttp.test_utils import TestServer
 
-from minivllm.async_engine import AsyncEngine
+from minivllm.async_engine import ProcessEngine, ThreadEngine
 from minivllm.engine import EngineConfig, LLMEngine
 from minivllm.model_runner import MODELS
 from minivllm.sequence import SamplingParams
@@ -101,14 +102,19 @@ async def stream(session, url, payload):
 
 
 async def wait_idle(aeng, timeout=10.0):
+    """Whether the engine runs dry, with no requests left and the KV pool empty, within timeout seconds."""
     t = time.perf_counter()
-    while aeng.engine.has_unfinished() and time.perf_counter() - t < timeout:
+    while True:
+        s = await aeng.query("stats")
+        if not s["unfinished"] and s["requests"] == 0 and s["allocated_slots"] == 0:
+            return True
+        if time.perf_counter() - t > timeout:
+            return False
         await asyncio.sleep(0.05)
-    await asyncio.sleep(0.05)
-    return not aeng.engine.has_unfinished() and aeng.engine.kv.allocated_slots() == 0
 
 
 async def test_server(aeng, tok, prompts, refs, max_tokens):
+    print(f"--- engine: {type(aeng).__name__}")
     server = TestServer(make_app(aeng, tok, "qwen3"))
     await server.start_server()
     url = lambda path: str(server.make_url(path))
@@ -159,14 +165,14 @@ async def test_server(aeng, tok, prompts, refs, max_tokens):
         check(await wait_idle(aeng), "a stopped request is aborted: the KV pool is empty")
 
         # a client that goes away
-        before = aeng.engine.kv.allocated_slots()
+        before = (await aeng.query("stats"))["allocated_slots"]
         resp = await s.post(url("/v1/completions"), json={"prompt": prompts[1], "max_tokens": 900, "ignore_eos": True, "stream": True})
         n = 0
         async for line in resp.content:
             n += line.startswith(b"data: ")
             if n == 3:
                 break
-        busy = aeng.engine.has_unfinished()
+        busy = (await aeng.query("stats"))["unfinished"]
         resp.close()  # drops the connection
         check(before == 0 and busy and await wait_idle(aeng), "a client disconnecting mid-stream: its request is aborted, the pool emptied")
 
@@ -206,9 +212,10 @@ def main():
     prompts = [[rng.randrange(10000) for _ in range(rng.randrange(20, 200))] for _ in range(3)]
     prompts += [tok.encode("The capital of France is"), tok.encode("def fibonacci(n):")]
     refs = reference_texts(prompts, max_tokens, tok)
-    aeng = AsyncEngine(CFG, warmup_temperature=None)
-    asyncio.run(test_server(aeng, tok, prompts, refs, max_tokens))
-    aeng.shutdown()
+    for kind in (ProcessEngine, ThreadEngine):
+        aeng = kind(CFG, warmup_temperature=None)
+        asyncio.run(test_server(aeng, tok, prompts, refs, max_tokens))
+        aeng.shutdown()
     print("PASS" if ok else "FAIL")
 
 
